@@ -12,10 +12,8 @@ env/
 .env
 .env.*
 
-# SQLite databases
-*.db
-*.db-shm
-*.db-wal
+# App runtime data
+data/
 
 # macOS
 .DS_Store
