@@ -69,6 +69,9 @@ WRITE_COMMAND_PATTERNS = [
     r"\byum\s+(install|remove|erase)\b",
     r"\bpip\s+install\b",
     r"\bnpm\s+(install|uninstall)\b",
+    r"\b(sed|perl)\s+-i\b",
+    r"\b(touch|truncate|mv|cp|mkdir|rmdir|ln|chmod|chown|chgrp)\b",
+    r"(^|[;|&\\s])\\w[^\\n]*>\\s*[^\\s]+",
 ]
 
 ALLOWED_IMAGE_MIME_TYPES = {
