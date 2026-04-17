@@ -1,16 +1,20 @@
 import asyncio
 import base64
+import ipaddress
 import json
+import logging
 import os
 import re
 import sqlite3
 import subprocess
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Literal, Optional
+from typing import Generator, Literal, Optional
+from urllib.parse import urlparse as _urlparse
 
 import fitz
 import httpx
@@ -18,9 +22,20 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("jerry")
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-TEXT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:2b-q4_K_M")
+TEXT_MODEL_FAST = os.getenv("OLLAMA_MODEL_FAST", "qwen3.5:2b-q4_K_M")
+TEXT_MODEL_QUALITY = os.getenv("OLLAMA_MODEL_QUALITY", "qwen3.5:4b-q4_K_M")
+DEFAULT_TEXT_MODEL_MODE = os.getenv("DEFAULT_TEXT_MODEL_MODE", "fast")
 VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:2b-instruct-q4_K_M")
+# 4B used for tool-calling loops — small models narrate instead of invoking tools.
+TOOLS_MODEL = TEXT_MODEL_QUALITY
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "14"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "300"))
@@ -66,6 +81,16 @@ BLOCKED_COMMAND_PATTERNS = [
     "rm -rf", "rm -f /", "dd if=", "mkfs", "> /dev/",
     "shutdown", "reboot", "halt", "poweroff",
     ":(){ :|:& };:",
+]
+
+# Regex-based blocklist for more robust matching
+BLOCKED_COMMAND_REGEXES = [
+    r'\brm\s+(-\S+\s+)*/',
+    r'\bdd\b',
+    r'\bmkfs\b',
+    r'\bsudo\b',
+    r'\bchmod\s+777\b',
+    r'>\s*/dev/',
 ]
 
 JERRY_TOOLS = [
@@ -186,8 +211,11 @@ JERRY_TOOLS = [
 ]
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+# Store DB on internal drive so it is always accessible at boot,
+# even before the external repo volume has mounted.
+DATA_DIR = Path.home() / "Library" / "Application Support" / "ai-mobile-chat"
 DB_PATH = DATA_DIR / "jerry_chat.db"
+_LEGACY_DB_PATH = APP_DIR / "data" / "jerry_chat.db"
 
 ASSISTANT_NAME = "Jerry"
 
@@ -203,8 +231,10 @@ Core identity:
 
 Capabilities — always be honest:
 - You have access to the operator's persistent memory (infrastructure facts, runbooks, service details) injected below.
-- When tools are enabled: USE them immediately — run queries, check services, gather evidence, then answer.
+- When tools are enabled: CALL A TOOL IMMEDIATELY. Do not describe what you plan to do. Do not ask for confirmation. Execute the most relevant tool call right now, then interpret the result.
 - When tools are NOT enabled: tell the user to enable the Tools toggle so you can execute directly. NEVER say "I cannot run commands" — say "Enable the Tools toggle and I'll run that for you."
+- You have NO internet or web search capability. Do not claim to search the web, call any "search" tool, or fetch URLs. If asked about current events or information you don't have, say so plainly.
+- prometheus_query and loki_query only work when running inside the Kubernetes cluster. From the Mac host these will always fail — if they error, inform the user: "These metrics are only accessible from within the cluster."
 
 Tool rules (STRICTLY ENFORCED):
 - run_command: READ-ONLY queries only (kubectl get/describe/logs/top, helm list, argocd app get, curl, ping, df, ps, journalctl, cat, grep). NEVER use for mutating operations.
@@ -214,12 +244,21 @@ Tool rules (STRICTLY ENFORCED):
 - propose_write: REQUIRED for ANY write/mutating operation. This presents an approval card to the operator. Do not attempt to run write commands via run_command — they will be blocked. Always use propose_write for: kubectl apply/delete/patch/scale/rollout restart, helm install/upgrade, argocd sync, git push, vault write, systemctl, package installs.
 - save_memory: Persist important findings, runbook steps, or decisions for future conversations.
 
+Tool discipline (HARD RULES — never violate):
+1. When tools are enabled and the request requires live data: call a tool FIRST. Never write a prose response before your first tool call.
+2. After a tool returns output: if the output is sufficient to answer the user, STOP using tools and give the final answer immediately.
+3. Use at most one follow-up tool call after receiving relevant output, unless the user explicitly asks for deeper inspection.
+4. Never call the same tool twice for the same purpose in one turn.
+5. For ordinary conversational questions that do not require live system state: do NOT use tools. Answer directly.
+6. If the tool result is incomplete or failed, explain what is missing instead of looping blindly.
+7. Maximum 3 tool-use rounds per turn — after that, summarise what you found and state what is missing.
+
 Verification workflow:
-1. Gather evidence first (run_command, prometheus_query, loki_query) to understand the problem.
-2. Propose a solution with clear reasoning.
+1. Call the most relevant tool immediately — no preamble.
+2. Interpret the output and propose a solution with clear reasoning.
 3. For write operations, use propose_write — the operator will approve or deny.
-4. After approval + execution, verify the fix by querying again.
-- Always show command output before commentary. Verify your own suggestions.""".strip()
+4. After approval + execution, verify the fix with one follow-up read query.
+- Always show command output before commentary. Never fabricate tool results.""".strip()
 
 MODE_INSTRUCTIONS = {
     "general": "Default mode. Be broadly helpful and concise.",
@@ -243,6 +282,7 @@ class AttachmentInput(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: Optional[int] = None
     mode: Literal["general", "homelab", "devops", "coding"] = "general"
+    text_model_mode: Literal["fast", "quality"] = DEFAULT_TEXT_MODEL_MODE
     message: str = Field("", max_length=MAX_USER_MESSAGE_CHARS)
     attachments: list[AttachmentInput] = Field(default_factory=list)
     think: bool = False
@@ -263,13 +303,32 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_db_connection() -> sqlite3.Connection:
+@contextmanager
+def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
+    """Context manager that opens, yields, and always closes a DB connection.
+
+    Every `with get_db_connection() as conn:` call-site already calls
+    conn.commit() explicitly where needed.  We add a safety commit on clean
+    exit so write-only paths that skip an explicit commit still persist, and
+    we always close in `finally` so file handles are released immediately.
+    """
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    # Auto-checkpoint WAL when it reaches ~4 MB (1000 pages × 4096 bytes).
+    # Prevents the WAL from growing unbounded across a long session.
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -378,9 +437,27 @@ def init_db() -> None:
                     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
                 END"""
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("FTS5 setup failed: %s", exc)
         conn.commit()
+
+
+def migrate_legacy_db() -> None:
+    """
+    One-time migration: copy the old repo-relative data/jerry_chat.db into the
+    new Application Support path so existing conversations and memories survive.
+    Only runs if the new path is empty but the old one exists.
+    """
+    import shutil
+    if DB_PATH.exists():
+        return  # Already migrated or freshly initialised — nothing to do.
+    if not _LEGACY_DB_PATH.exists():
+        return  # No legacy DB to migrate.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_LEGACY_DB_PATH, DB_PATH)
+    except Exception as exc:
+        logger.warning("Legacy DB migration failed: %s", exc)  # Non-fatal — init_db will create a fresh DB if copy failed.
 
 
 def now_iso() -> str:
@@ -484,7 +561,7 @@ async def get_embedding(text: str) -> list[float] | None:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/api/embed",
-                json={"model": TEXT_MODEL, "input": text},
+                json={"model": EMBED_MODEL, "input": text},
             )
             data = resp.json()
             embeddings = data.get("embeddings", [])
@@ -540,7 +617,7 @@ def build_system_prompt(mode: str) -> str:
     return prompt
 
 
-def build_system_prompt_with_semantic_context(mode: str, user_query: str) -> str:
+async def build_system_prompt_with_semantic_context(mode: str, user_query: str) -> str:
     """
     Like build_system_prompt but uses semantic similarity to inject the most
     relevant memories for this specific query rather than all memories.
@@ -554,8 +631,8 @@ def build_system_prompt_with_semantic_context(mode: str, user_query: str) -> str
             f"\n- The user's preferred name is {preferred_name}."
             f"\n- Address the user as {preferred_name} when natural and appropriate."
         )
-    # Try semantic retrieval first
-    query_emb = get_embedding_sync(user_query)
+    # Try semantic retrieval first (run in thread pool to avoid blocking event loop)
+    query_emb = await asyncio.to_thread(get_embedding_sync, user_query)
     if query_emb:
         relevant = semantic_search_memories(query_emb, top_k=8)
         if relevant:
@@ -596,12 +673,13 @@ def search_messages(query: str, limit: int = 30) -> list[dict]:
 
 
 def get_client_ip(request: Request) -> str:
-    x_forwarded_for = request.headers.get("x-forwarded-for", "").strip()
-    if x_forwarded_for:
-        return x_forwarded_for.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
+    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if cf_ip:
+        return cf_ip
+    forwarded = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def get_authenticated_identity(request: Request) -> str:
@@ -922,11 +1000,13 @@ def prepare_current_turn_content(
     return content, image_payloads, attachment_meta
 
 
-def select_model_for_request(image_payloads: list[str]) -> str:
-    return VISION_MODEL if image_payloads else TEXT_MODEL
+def select_model_for_request(image_payloads: list[str], text_model_mode: str = DEFAULT_TEXT_MODEL_MODE) -> str:
+    if image_payloads:
+        return VISION_MODEL
+    return TEXT_MODEL_QUALITY if text_model_mode == "quality" else TEXT_MODEL_FAST
 
 
-def build_ollama_messages(
+async def build_ollama_messages(
     conversation_id: int,
     mode: str,
     current_user_content: str,
@@ -937,7 +1017,7 @@ def build_ollama_messages(
 
     # Use semantic context retrieval when a text query is available (no images)
     if current_user_content and not current_user_images:
-        system_content = build_system_prompt_with_semantic_context(mode, current_user_content)
+        system_content = await build_system_prompt_with_semantic_context(mode, current_user_content)
     else:
         system_content = build_system_prompt(mode)
 
@@ -963,6 +1043,18 @@ def build_ollama_messages(
         current_msg["images"] = current_user_images
 
     ollama_messages.append(current_msg)
+
+    # Rough token estimate (1 token ≈ 4 chars). Warn if approaching model context limits.
+    total_chars = sum(len(str(m.get("content") or "")) for m in ollama_messages)
+    estimated_tokens = total_chars // 4
+    if estimated_tokens > 6000:
+        logger.warning("Context size ~%d tokens (chars=%d) — may approach model context limit", estimated_tokens, total_chars)
+    if estimated_tokens > 7000:
+        warning_note = f"[Context warning: this conversation is long (~{estimated_tokens} tokens). Consider starting a new chat for best results.]"
+        # Inject at top of system prompt
+        if ollama_messages and ollama_messages[0]["role"] == "system":
+            ollama_messages[0]["content"] = warning_note + "\n\n" + ollama_messages[0]["content"]
+
     return ollama_messages
 
 
@@ -1039,7 +1131,12 @@ def is_command_safe(cmd: str) -> tuple[bool, str]:
     cmd_lower = cmd.lower()
     for pattern in BLOCKED_COMMAND_PATTERNS:
         if pattern.lower() in cmd_lower:
+            logger.warning("run_command BLOCKED: %s", cmd[:120])
             return False, f"Command blocked: contains '{pattern}'"
+    for regex in BLOCKED_COMMAND_REGEXES:
+        if re.search(regex, cmd, re.IGNORECASE):
+            logger.warning("run_command BLOCKED: %s", cmd[:120])
+            return False, f"Command blocked by security policy"
     return True, ""
 
 
@@ -1051,6 +1148,30 @@ def is_write_command(cmd: str) -> bool:
     return False
 
 
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """Return (is_safe, reason). Blocks private IPs, localhost, file://, metadata endpoints."""
+    try:
+        parsed = _urlparse(url)
+    except Exception:
+        return False, "invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"scheme '{parsed.scheme}' not allowed"
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return False, "no hostname"
+    # Block obvious local names
+    blocked_names = {"localhost", "metadata.google.internal", "metadata.gcp.internal"}
+    if hostname.lower() in blocked_names:
+        return False, f"hostname '{hostname}' is blocked"
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            return False, f"IP {hostname} is in a private/reserved range"
+    except ValueError:
+        pass  # hostname, not an IP — fine
+    return True, ""
+
+
 def store_pending_write(command: str, reasoning: str, conversation_id: int | None = None) -> int:
     t = now_iso()
     with get_db_connection() as conn:
@@ -1060,6 +1181,28 @@ def store_pending_write(command: str, reasoning: str, conversation_id: int | Non
         )
         conn.commit()
         return int(cur.lastrowid)
+
+
+_TOOL_OUTPUT_MAX_LINES = 60
+_TOOL_OUTPUT_MAX_CHARS = 2000
+
+
+def _truncate_tool_output(text: str) -> str:
+    """
+    Limit tool output to a size the local model can reason about without hanging.
+    Prefer line-based truncation so structured output (kubectl, helm) stays readable.
+    Appends a summary note when truncated so the model knows data was cut.
+    """
+    lines = text.splitlines()
+    total_lines = len(lines)
+    kept = lines[:_TOOL_OUTPUT_MAX_LINES]
+    result = "\n".join(kept)
+    if len(result) > _TOOL_OUTPUT_MAX_CHARS:
+        result = result[:_TOOL_OUTPUT_MAX_CHARS]
+        result += f"\n[truncated — output too large for local model context]"
+    elif total_lines > _TOOL_OUTPUT_MAX_LINES:
+        result += f"\n[truncated: {total_lines - _TOOL_OUTPUT_MAX_LINES} more lines not shown — use a narrower query, e.g. add -n <namespace>]"
+    return result
 
 
 def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> str:
@@ -1082,8 +1225,18 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
                 timeout=TOOL_COMMAND_TIMEOUT,
                 env={**os.environ, "KUBECONFIG": os.environ.get("KUBECONFIG", os.path.expanduser("~/.kube/config"))},
             )
-            output = (result.stdout + result.stderr).strip()
-            return output[:4000] if output else "(no output)"
+            logger.info("run_command: %s (exit=%d)", cmd[:120], result.returncode)
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            if stdout and stderr:
+                output = f"[stdout]\n{stdout}\n[stderr]\n{stderr}"
+            else:
+                output = (stdout or stderr)
+            if result.returncode != 0:
+                output = f"[exit code: {result.returncode}]\n{output}" if output else f"[exit code: {result.returncode}]"
+            if not output:
+                return "(no output)"
+            return _truncate_tool_output(output)
         except subprocess.TimeoutExpired:
             return f"Error: command timed out after {TOOL_COMMAND_TIMEOUT}s."
         except Exception as exc:
@@ -1112,7 +1265,11 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
                 lines.append(f"  {metric}: {value[1]}")
             return "\n".join(lines)
         except Exception as exc:
-            return f"Error querying Prometheus ({PROMETHEUS_BASE_URL}): {exc}"
+            return (
+                f"Cannot reach Prometheus ({PROMETHEUS_BASE_URL}): {exc}\n"
+                "Note: This URL is Kubernetes in-cluster DNS — it is only reachable from within the cluster, not from the Mac host. "
+                "Inform the user: Prometheus metrics are not accessible from this machine."
+            )
 
     elif name == "loki_query":
         query = args.get("query", "").strip()
@@ -1157,20 +1314,25 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
                     break
             return "\n".join(lines)
         except Exception as exc:
-            return f"Error querying Loki ({LOKI_BASE_URL}): {exc}"
+            return (
+                f"Cannot reach Loki ({LOKI_BASE_URL}): {exc}\n"
+                "Note: This URL is Kubernetes in-cluster DNS — it is only reachable from within the cluster, not from the Mac host. "
+                "Inform the user: Loki logs are not accessible from this machine."
+            )
 
     elif name == "check_url":
-        import urllib.request
         url = args.get("url", "").strip()
-        timeout = int(args.get("timeout", 5))
+        timeout = min(int(args.get("timeout", 5)), 10)
         if not url:
             return "Error: no URL provided."
+        safe, reason = _is_safe_url(url)
+        if not safe:
+            return f"Error: URL blocked — {reason}"
         try:
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("User-Agent", "Jerry-InfraForge/1.0")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read(512).decode("utf-8", errors="replace")
-                return f"HTTP {resp.status} {resp.reason}\nBody preview: {body[:300]}"
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.get(url, headers={"User-Agent": "Jerry-InfraForge/1.0"}, follow_redirects=True)
+                body = resp.text[:512]
+                return f"HTTP {resp.status_code}\nBody preview: {body[:300]}"
         except Exception as exc:
             return f"Unreachable: {exc}"
 
@@ -1191,23 +1353,54 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         content  = args.get("content", "").strip()
         if not title or not content:
             return "Error: title and content required."
+        # Check for existing memory with same category+title (deduplication)
+        with get_db_connection() as conn:
+            existing = conn.execute(
+                "SELECT id FROM memories WHERE category = ? AND lower(title) = lower(?)",
+                (category, title)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+                    (content, datetime.now(timezone.utc).isoformat(), existing["id"])
+                )
+                conn.commit()
+                return f"Memory updated: [{category}] {title}"
         mem_id = create_memory(category, title, content)
         return f"Memory saved (id={mem_id}): [{category}] {title}"
 
     return f"Error: unknown tool '{name}'."
 
 
+def _inject_tool_force(messages: list[dict]) -> list[dict]:
+    """
+    Append a tool-forcing cue to the final user message so small models
+    call a tool immediately rather than narrating what they would do.
+    Only mutates a copy — never modifies the original list.
+    """
+    msgs = list(messages)
+    if msgs and msgs[-1]["role"] == "user":
+        original = msgs[-1].get("content", "")
+        msgs[-1] = {
+            **msgs[-1],
+            "content": original + "\n\n[Call a tool now to gather evidence. Do not write a text response before calling at least one tool.]",
+        }
+    return msgs
+
+
 async def run_tool_loop(
     messages: list[dict],
     model: str,
     think: bool,
+    conversation_id: Optional[int] = None,
 ) -> tuple[str, list[dict]]:
     tool_events: list[dict] = []
-    for _ in range(6):
+    msgs = _inject_tool_force(messages)
+    for _ in range(3):
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/api/chat",
-                json={"model": model, "messages": messages, "stream": False, "think": think, "tools": JERRY_TOOLS},
+                json={"model": TOOLS_MODEL, "messages": msgs, "stream": False, "think": think, "tools": JERRY_TOOLS},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1217,14 +1410,14 @@ async def run_tool_loop(
             content = msg.get("content", "")
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             return content, tool_events
-        messages.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tool_calls})
+        msgs.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tool_calls})
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name", "")
             args = fn.get("arguments", {})
-            result = execute_tool(name, args)
+            result = execute_tool(name, args, conversation_id=conversation_id)
             tool_events.append({"tool": name, "args": args, "result": result})
-            messages.append({"role": "tool", "content": result})
+            msgs.append({"role": "tool", "content": result})
     return "Reached maximum tool-use rounds without a final answer.", tool_events
 
 
@@ -1237,7 +1430,7 @@ async def generate_smart_title(conversation_id: int, user_msg: str, assistant_ms
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/api/chat",
-                json={"model": TEXT_MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False, "think": False},
+                json={"model": TEXT_MODEL_FAST, "messages": [{"role": "user", "content": prompt}], "stream": False, "think": False},
             )
             resp.raise_for_status()
             title = resp.json().get("message", {}).get("content", "").strip().strip('"\'').strip()
@@ -1245,15 +1438,50 @@ async def generate_smart_title(conversation_id: int, user_msg: str, assistant_ms
                 with get_db_connection() as conn:
                     conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
                     conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Smart title generation failed: %s", exc)
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    logger.info("Jerry starting up — DB: %s", DB_PATH)
+    migrate_legacy_db()
     init_db()
+    logger.info("DB initialised")
+    # Clean up stale pending_writes older than 24 hours
+    with get_db_connection() as conn:
+        deleted = conn.execute(
+            "DELETE FROM pending_writes WHERE status = 'pending' AND created_at < datetime('now', '-24 hours')"
+        ).rowcount
+        conn.commit()
+        if deleted:
+            logger.info("Cleaned up %d stale pending_writes", deleted)
+    # Mark empty assistant messages left by mid-stream crashes
+    with get_db_connection() as conn:
+        fixed = conn.execute(
+            """UPDATE messages SET content = '[Response interrupted]'
+               WHERE role = 'assistant' AND (content = '' OR content IS NULL)"""
+        ).rowcount
+        conn.commit()
+        if fixed:
+            logger.info("Marked %d interrupted assistant messages", fixed)
+    # Mark dangling user messages (no following assistant reply)
+    with get_db_connection() as conn:
+        dangling = conn.execute(
+            """SELECT m.id FROM messages m
+               WHERE m.role = 'user'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM messages m2
+                   WHERE m2.conversation_id = m.conversation_id
+                     AND m2.role = 'assistant'
+                     AND m2.id > m.id
+                 )"""
+        ).fetchall()
+        if dangling:
+            logger.info("Found %d potentially dangling user messages (last sends, not marking)", len(dangling))
     # Backfill embeddings for any memories that don't have one yet
     asyncio.create_task(_backfill_embeddings())
+    logger.info("Startup complete")
 
 
 async def _backfill_embeddings() -> None:
@@ -1269,21 +1497,46 @@ async def _backfill_embeddings() -> None:
             emb = await get_embedding(text)
             if emb:
                 store_embedding(int(row["id"]), emb)
-        except Exception:
-            pass  # Non-fatal — system works without embeddings, uses all-memories fallback
+        except Exception as exc:
+            logger.warning("Embedding backfill failed: %s", exc)  # Non-fatal — system works without embeddings, uses all-memories fallback
 
 
 @app.get("/health")
 async def health() -> dict:
-    mems = list_memories()
+    # DB calls are wrapped so a transient DB error never returns a 500.
+    # The frontend uses any non-200 response to show "Backend unreachable".
+    try:
+        mems = list_memories()
+        memory_count = len(mems)
+        preferred_name = get_preferred_name()
+        db_status = "ok"
+    except Exception as exc:
+        memory_count = 0
+        preferred_name = ""
+        db_status = f"degraded: {exc}"
+
+    # Probe Ollama
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            ollama_resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+        ollama_status = "ok" if ollama_resp.status_code == 200 else f"http {ollama_resp.status_code}"
+    except Exception as exc:
+        ollama_status = f"unreachable: {exc}"
+
+    overall_status = "ok" if (db_status == "ok" and ollama_status == "ok") else "degraded"
+
     return {
-        "status": "ok",
+        "status": overall_status,
+        "db_status": db_status,
+        "ollama_status": ollama_status,
         "assistant_name": ASSISTANT_NAME,
         "ollama_base_url": OLLAMA_BASE_URL,
-        "text_model": TEXT_MODEL,
+        "text_model_fast": TEXT_MODEL_FAST,
+        "text_model_quality": TEXT_MODEL_QUALITY,
+        "default_text_model_mode": DEFAULT_TEXT_MODEL_MODE,
         "vision_model": VISION_MODEL,
-        "preferred_name": get_preferred_name(),
-        "memory_count": len(mems),
+        "preferred_name": preferred_name,
+        "memory_count": memory_count,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         "rate_limit_max_requests": RATE_LIMIT_MAX_REQUESTS,
         "max_user_message_chars": MAX_USER_MESSAGE_CHARS,
@@ -1305,7 +1558,9 @@ async def session_info(request: Request) -> dict:
 async def diagnostics(request: Request) -> dict:
     return {
         "assistant_name": ASSISTANT_NAME,
-        "text_model": TEXT_MODEL,
+        "text_model_fast": TEXT_MODEL_FAST,
+        "text_model_quality": TEXT_MODEL_QUALITY,
+        "default_text_model_mode": DEFAULT_TEXT_MODEL_MODE,
         "vision_model": VISION_MODEL,
         "health": {
             "status": "ok",
@@ -1445,6 +1700,7 @@ async def approve_write(write_id: int) -> JSONResponse:
             (output, now_iso(), write_id),
         )
         conn.commit()
+    logger.info("approve_write executed: %s", cmd[:120])
     return JSONResponse({"status": "approved", "output": output, "command": cmd})
 
 
@@ -1513,14 +1769,14 @@ async def chat(payload: ChatRequest, request: Request, background_tasks: Backgro
         model_used=None,
     )
 
-    ollama_messages = build_ollama_messages(
+    ollama_messages = await build_ollama_messages(
         conversation_id=conversation_id,
         mode=mode,
         current_user_content=current_user_content,
         current_user_images=current_user_images,
     )
 
-    selected_model = select_model_for_request(current_user_images)
+    selected_model = select_model_for_request(current_user_images, payload.text_model_mode)
     started_at = time.perf_counter()
     tool_events: list[dict] = []
 
@@ -1559,7 +1815,7 @@ async def chat(payload: ChatRequest, request: Request, background_tasks: Backgro
 
     # Smart title on first assistant response
     msg_count = len(fetch_messages(conversation_id))
-    if msg_count == 2:
+    if msg_count <= 2:
         background_tasks.add_task(generate_smart_title, conversation_id, user_content_for_storage, answer)
 
     conversation_payload = get_conversation_payload(conversation_id)
@@ -1624,14 +1880,14 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
         model_used=None,
     )
 
-    ollama_messages = build_ollama_messages(
+    ollama_messages = await build_ollama_messages(
         conversation_id=conversation_id,
         mode=mode,
         current_user_content=current_user_content,
         current_user_images=current_user_images,
     )
 
-    selected_model = select_model_for_request(current_user_images)
+    selected_model = select_model_for_request(current_user_images, payload.text_model_mode)
     assistant_message_id = save_message(
         conversation_id=conversation_id,
         role="assistant",
@@ -1651,44 +1907,23 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
         full_thinking = ""
         tool_events: list[dict] = []
 
-        # Tools mode: run tool loop first, then stream final answer
+        # Tools mode: run tool loop first, then stream final answer.
         if payload.tools_enabled and not current_user_images:
             try:
-                msgs_copy = list(ollama_messages)
-                for _ in range(6):
-                    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-                        resp = await client.post(
-                            f"{OLLAMA_BASE_URL}/api/chat",
-                            json={"model": selected_model, "messages": msgs_copy, "stream": False, "think": payload.think, "tools": JERRY_TOOLS},
-                        )
-                        resp.raise_for_status()
-                        data = resp.json()
-                    msg = data.get("message", {})
-                    tc_list = msg.get("tool_calls", [])
-                    if not tc_list:
-                        raw = msg.get("content", "")
-                        full_answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-                        break
-                    msgs_copy.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tc_list})
-                    for tc in tc_list:
-                        fn = tc.get("function", {})
-                        tname = fn.get("name", "")
-                        targs = fn.get("arguments", {})
-                        yield f"data: {json.dumps({'type': 'tool_call', 'name': tname, 'args': targs}, ensure_ascii=False)}\n\n"
-                        result = execute_tool(tname, targs, conversation_id=_conv_id)
-                        tool_events.append({"tool": tname, "args": targs, "result": result})
-                        # Emit approval_request event for propose_write so UI can render an approval card
-                        if tname == "propose_write" and result.startswith("APPROVAL_PENDING:"):
-                            pending_id = result.split(":", 1)[1]
-                            yield f"data: {json.dumps({'type': 'approval_request', 'id': pending_id, 'command': targs.get('command', ''), 'reasoning': targs.get('reasoning', '')}, ensure_ascii=False)}\n\n"
-                        yield f"data: {json.dumps({'type': 'tool_result', 'name': tname, 'result': result}, ensure_ascii=False)}\n\n"
-                        msgs_copy.append({"role": "tool", "content": result})
-                else:
-                    full_answer = "Reached maximum tool-use rounds without a final answer."
+                full_answer, tool_events = await run_tool_loop(ollama_messages, TOOLS_MODEL, payload.think, conversation_id=_conv_id)
+                # Emit tool events for UI
+                for te in tool_events:
+                    yield f"data: {json.dumps({'type': 'tool_call', 'name': te['tool'], 'args': te['args']}, ensure_ascii=False)}\n\n"
+                    # Emit approval_request event for propose_write so UI can render an approval card
+                    if te['tool'] == "propose_write" and str(te['result']).startswith("APPROVAL_PENDING:"):
+                        pending_id = str(te['result']).split(":", 1)[1]
+                        yield f"data: {json.dumps({'type': 'approval_request', 'id': pending_id, 'command': te['args'].get('command', ''), 'reasoning': te['args'].get('reasoning', '')}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'tool_result', 'name': te['tool'], 'result': te['result']}, ensure_ascii=False)}\n\n"
 
-                # Emit the answer as tokens
-                for ch in full_answer:
-                    yield f"data: {json.dumps({'type': 'token', 'token': ch}, ensure_ascii=False)}\n\n"
+                # Emit answer in chunks (words + spaces) instead of char-by-char
+                import re as _re
+                for chunk in _re.findall(r'\S+\s*', full_answer):
+                    yield f"data: {json.dumps({'type': 'token', 'token': chunk}, ensure_ascii=False)}\n\n"
 
             except Exception as exc:
                 update_assistant_message(
@@ -1794,7 +2029,7 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
 
         # Smart title on first response
         msg_count = len(fetch_messages(_conv_id))
-        if msg_count == 2:
+        if msg_count <= 2:
             asyncio.ensure_future(generate_smart_title(_conv_id, _user_content, full_answer))
 
         conversation_payload = get_conversation_payload(_conv_id)
@@ -1809,7 +2044,14 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
             done_payload["thinking"] = full_thinking
         yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1876,7 +2118,7 @@ async def index() -> str:
       padding-left: max(16px,env(safe-area-inset-left));
       padding-right: max(16px,env(safe-area-inset-right));
       overflow-y: auto; -webkit-overflow-scrolling: touch;
-      max-height: 60dvh; max-height: 60vh; overscroll-behavior: contain;
+      max-height: 75dvh; max-height: 75vh; overscroll-behavior: contain;
     }
     .settings-drawer.open { display: flex; }
     .settings-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -1940,6 +2182,22 @@ async def index() -> str:
     .memory-del { background: none; border: none; color: #ff453a; font-size: 18px; cursor: pointer; padding: 0 2px; flex-shrink: 0; line-height: 1; }
 
     /* Search results */
+    /* History list */
+    .conv-list { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+    .conv-item {
+      display: flex; flex-direction: column; gap: 2px;
+      padding: 10px 12px; border-radius: 10px;
+      background: rgba(255,255,255,0.04); cursor: pointer;
+      border: 1px solid transparent; transition: background 0.12s;
+      touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+    }
+    .conv-item:active { background: rgba(255,255,255,0.1); }
+    .conv-item.active-conv {
+      background: rgba(10,132,255,0.15);
+      border-color: rgba(10,132,255,0.35);
+    }
+    .conv-item-title { font-size: 13px; color: #f2f2f7; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .conv-item-meta  { font-size: 11px; color: #636366; }
     .search-results { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
     .search-result {
       padding: 8px; background: rgba(255,255,255,0.04);
@@ -2003,6 +2261,20 @@ async def index() -> str:
       background: rgba(255,255,255,0.12); border-radius: 6px;
       padding: 1px 5px; font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size: 13px;
     }
+
+    .md h1 { font-size: 18px; font-weight: 700; margin: 10px 0 6px; color: #f2f2f7; }
+    .md h2 { font-size: 16px; font-weight: 700; margin: 8px 0 5px; color: #f2f2f7; }
+    .md h3 { font-size: 14px; font-weight: 600; margin: 6px 0 4px; color: #ebebf5; }
+    .md ol { margin: 6px 0 8px 18px; }
+    .md blockquote { border-left: 3px solid rgba(255,255,255,0.2); margin: 6px 0; padding: 4px 10px; color: #8e8e93; font-style: italic; }
+
+    /* Markdown tables */
+    .md-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 8px 0; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); }
+    .md table { border-collapse: collapse; min-width: 100%; font-size: 13px; }
+    .md th, .md td { padding: 7px 12px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.07); white-space: nowrap; }
+    .md th { background: rgba(255,255,255,0.06); font-weight: 600; color: #ebebf5; border-bottom: 1px solid rgba(255,255,255,0.14); }
+    .md tr:last-child td { border-bottom: none; }
+    .md tr:hover td { background: rgba(255,255,255,0.03); }
 
     /* Code blocks */
     .code-block {
@@ -2127,6 +2399,10 @@ async def index() -> str:
       touch-action: manipulation; -webkit-tap-highlight-color: transparent;
     }
     .latency-tag { color: #636366; }
+
+    /* Streaming cursor */
+    .cursor-blink { display: inline-block; animation: blink 0.8s step-end infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
 
     /* Typing indicator */
     .typing-row { display: flex; align-items: flex-end; gap: 8px; margin-bottom: 10px; }
@@ -2282,17 +2558,18 @@ async def index() -> str:
   </div>
 
   <div id="drawer" class="settings-drawer">
-    <div class="s-label">Conversation</div>
+    <div class="s-label">History</div>
     <div class="settings-row">
-      <select id="conversationSelect" class="s-select"></select>
+      <input id="convSearchInput" class="s-input" type="search" placeholder="Filter chats..." autocomplete="off" />
     </div>
-    <div class="settings-row">
+    <div id="convList" class="conv-list"></div>
+    <div class="settings-row" style="margin-top:8px">
       <button id="newChatBtn"    class="s-btn s-grey">New chat</button>
-      <button id="deleteChatBtn" class="s-btn s-red">Delete chat</button>
+      <button id="deleteChatBtn" class="s-btn s-red">Delete</button>
     </div>
     <div class="settings-row">
-      <button id="exportMdBtn"  class="s-btn s-grey">Export markdown</button>
-      <button id="exportTxtBtn" class="s-btn s-grey">Export text</button>
+      <button id="exportMdBtn"  class="s-btn s-grey">Export .md</button>
+      <button id="exportTxtBtn" class="s-btn s-grey">Export .txt</button>
     </div>
     <div class="s-label">Mode</div>
     <div class="settings-row">
@@ -2301,6 +2578,13 @@ async def index() -> str:
         <option value="homelab">Homelab</option>
         <option value="devops">DevOps</option>
         <option value="coding">Coding</option>
+      </select>
+    </div>
+    <div class="s-label">Text model</div>
+    <div class="settings-row">
+      <select id="textModelModeSelect" class="s-select">
+        <option value="fast">Fast · Qwen 3.5 2B</option>
+        <option value="quality">Quality · Qwen 3.5 4B</option>
       </select>
     </div>
     <div class="s-label">Options</div>
@@ -2320,9 +2604,9 @@ async def index() -> str:
       <button id="saveProfileBtn"  class="s-btn s-blue">Save name</button>
       <button id="resetProfileBtn" class="s-btn s-grey">Reset name</button>
     </div>
-    <div class="s-label">Search conversations</div>
+    <div class="s-label">Search message content</div>
     <div class="settings-row">
-      <input id="searchInput" class="s-input" type="search" placeholder="Search conversations..." />
+      <input id="searchInput" class="s-input" type="search" placeholder="Search message content..." />
     </div>
     <div id="searchResults" class="search-results"></div>
     <div class="s-label">Persistent memory</div>
@@ -2388,8 +2672,10 @@ async def index() -> str:
   const memoryChipEl      = document.getElementById('memoryChip');
   const modeChipEl        = document.getElementById('modeChip');
   const sessionChipEl     = document.getElementById('sessionChip');
-  const modeSelectEl      = document.getElementById('modeSelect');
-  const convSelectEl      = document.getElementById('conversationSelect');
+  const modeSelectEl           = document.getElementById('modeSelect');
+  const textModelModeSelectEl  = document.getElementById('textModelModeSelect');
+  const convListEl             = document.getElementById('convList');
+  const convSearchInputEl      = document.getElementById('convSearchInput');
   const newChatBtnEl      = document.getElementById('newChatBtn');
   const deleteChatBtnEl   = document.getElementById('deleteChatBtn');
   const exportMdBtnEl     = document.getElementById('exportMdBtn');
@@ -2435,6 +2721,7 @@ async def index() -> str:
     let h = esc(text);
     h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
     h = h.replace(/[*][*]([^*]+)[*][*]/g, '<strong>$1</strong>');
+    h = h.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#0a84ff">$1</a>');
     return h;
   }
 
@@ -2447,8 +2734,30 @@ async def index() -> str:
       return '\\x00CODEBLOCK' + idx + '\\x00';
     });
 
-    const lines = placeholder_text.split('\\n');
-    let html = '', inList = false, para = [];
+    // Pre-process: group consecutive pipe-table lines into TABLE placeholders
+    const rawLines = placeholder_text.split('\\n');
+    const tableBlocks = [];
+    const processedLines = [];
+    let tableRows = [];
+    function flushTable() {
+      if (!tableRows.length) return;
+      // Filter out separator rows (---|--- style)
+      const dataRows = tableRows.filter(r => !/^[|\\s\\-:]+$/.test(r.replace(/\\|/g, '').trim() || ''));
+      if (dataRows.length < 1) { processedLines.push(...tableRows); tableRows = []; return; }
+      const idx = tableBlocks.length;
+      tableBlocks.push(dataRows);
+      processedLines.push('\\x00TABLE' + idx + '\\x00');
+      tableRows = [];
+    }
+    for (const raw of rawLines) {
+      const t = raw.trim();
+      if (t.startsWith('|') && t.endsWith('|')) { tableRows.push(t); }
+      else { flushTable(); processedLines.push(raw); }
+    }
+    flushTable();
+
+    const lines = processedLines;
+    let html = '', inList = false, inOList = false, para = [];
 
     function flushPara() {
       if (!para.length) return;
@@ -2458,7 +2767,7 @@ async def index() -> str:
         const b = blocks[idx];
         if (b) {
           const safeCode = b.code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-          html += '<div class="code-block"><div class="code-header"><span class="code-lang">' + esc(b.lang) + '</span><button class="code-copy-btn" data-code="' + b.code.replace(/"/g,'&quot;') + '">Copy</button></div><pre><code>' + safeCode + '</code></pre></div>';
+          html += '<div class="code-block"><div class="code-header"><span class="code-lang">' + esc(b.lang) + '</span><button class="code-copy-btn" data-code="' + b.code.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '">Copy</button></div><pre><code>' + safeCode + '</code></pre></div>';
         }
       } else {
         html += '<p>' + renderInlineMd(joined) + '</p>';
@@ -2466,24 +2775,68 @@ async def index() -> str:
       para = [];
     }
 
-    function closeList() { if (inList) { html += '</ul>'; inList = false; } }
+    function closeList() {
+      if (inList)  { html += '</ul>'; inList = false; }
+      if (inOList) { html += '</ol>'; inOList = false; }
+    }
+
+    function parseCells(row) {
+      return row.replace(/^\\|/, '').replace(/\\|$/, '').split('|').map(c => c.trim());
+    }
 
     for (const raw of lines) {
       const line = raw.trimEnd();
+      if (line.startsWith('\\x00TABLE') && line.endsWith('\\x00')) {
+        flushPara(); closeList();
+        const idx = parseInt(line.replace(/\\x00TABLE(\\d+)\\x00/, '$1'));
+        const rows = tableBlocks[idx];
+        if (rows && rows.length) {
+          const headers = parseCells(rows[0]);
+          let tHtml = '<div class="md-table-wrap"><table>';
+          tHtml += '<thead><tr>' + headers.map(h => '<th>' + renderInlineMd(h) + '</th>').join('') + '</tr></thead>';
+          if (rows.length > 1) {
+            tHtml += '<tbody>' + rows.slice(1).map(r => '<tr>' + parseCells(r).map(c => '<td>' + renderInlineMd(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+          }
+          tHtml += '</table></div>';
+          html += tHtml;
+        }
+        continue;
+      }
       if (line.startsWith('\\x00CODEBLOCK') && line.endsWith('\\x00')) {
         flushPara(); closeList();
         const idx = parseInt(line.replace(/\\x00CODEBLOCK(\\d+)\\x00/, '$1'));
         const b = blocks[idx];
         if (b) {
           const safeCode = b.code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-          html += '<div class="code-block"><div class="code-header"><span class="code-lang">' + esc(b.lang || 'text') + '</span><button class="code-copy-btn" data-code="' + b.code.replace(/"/g,'&quot;') + '">Copy</button></div><pre><code>' + safeCode + '</code></pre></div>';
+          html += '<div class="code-block"><div class="code-header"><span class="code-lang">' + esc(b.lang || 'text') + '</span><button class="code-copy-btn" data-code="' + b.code.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '">Copy</button></div><pre><code>' + safeCode + '</code></pre></div>';
         }
         continue;
       }
       if (!line.trim()) { flushPara(); closeList(); continue; }
+      // Headings
+      const h1 = line.match(/^#\\s+(.*)$/);
+      if (h1) { flushPara(); closeList(); html += '<h1>' + renderInlineMd(h1[1]) + '</h1>'; continue; }
+      const h2 = line.match(/^##\\s+(.*)$/);
+      if (h2) { flushPara(); closeList(); html += '<h2>' + renderInlineMd(h2[1]) + '</h2>'; continue; }
+      const h3 = line.match(/^###\\s+(.*)$/);
+      if (h3) { flushPara(); closeList(); html += '<h3>' + renderInlineMd(h3[1]) + '</h3>'; continue; }
+      // Blockquote
+      const bq = line.match(/^>\\s+(.*)$/);
+      if (bq) { flushPara(); closeList(); html += '<blockquote>' + renderInlineMd(bq[1]) + '</blockquote>'; continue; }
+      // Ordered list
+      const oli = line.match(/^\\d+\\.\\s+(.*)$/);
+      if (oli) {
+        flushPara();
+        if (inList) { html += '</ul>'; inList = false; }
+        if (!inOList) { html += '<ol>'; inOList = true; }
+        html += '<li>' + renderInlineMd(oli[1]) + '</li>';
+        continue;
+      }
+      // Unordered list
       const li = line.match(/^[-*]\\s+(.*)$/);
       if (li) {
         flushPara();
+        if (inOList) { html += '</ol>'; inOList = false; }
         if (!inList) { html += '<ul>'; inList = true; }
         html += '<li>' + renderInlineMd(li[1]) + '</li>';
         continue;
@@ -2537,25 +2890,89 @@ async def index() -> str:
     if (el) el.remove();
   }
 
-  function renderConvSelect() {
-    convSelectEl.innerHTML = '';
-    if (!conversations.length) {
-      const o = document.createElement('option');
-      o.value = ''; o.textContent = 'No conversations yet';
-      convSelectEl.appendChild(o); convSelectEl.disabled = true; return;
-    }
-    convSelectEl.disabled = false;
-    for (const c of conversations) {
-      const o = document.createElement('option');
-      o.value = String(c.id); o.textContent = c.title;
-      convSelectEl.appendChild(o);
-    }
-    if (activeConvId && conversations.some(c => c.id === activeConvId)) {
-      convSelectEl.value = String(activeConvId);
-    } else {
-      convSelectEl.value = String(conversations[0].id);
+  /* Streaming bubble — created once at stream start, updated per token */
+  let streamingBubbleEl = null;
+  let streamingContent = '';
+
+  function startStreamingBubble() {
+    streamingContent = '';
+    const row = document.createElement('div');
+    row.className = 'message-row jerry';
+    row.id = 'streaming-bubble';
+    const av = document.createElement('div');
+    av.className = 'avatar jerry-avatar'; av.textContent = 'J';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble jerry md';
+    bubble.innerHTML = '<span class="cursor-blink">\\u258b</span>';
+    row.appendChild(av); row.appendChild(bubble);
+    chatAreaEl.appendChild(row);
+    chatAreaEl.scrollTop = chatAreaEl.scrollHeight;
+    streamingBubbleEl = bubble;
+  }
+
+  function appendStreamingToken(token) {
+    streamingContent += token;
+    if (streamingBubbleEl) {
+      streamingBubbleEl.innerHTML = renderMd(streamingContent) + '<span class="cursor-blink">\\u258b</span>';
+      chatAreaEl.scrollTop = chatAreaEl.scrollHeight;
     }
   }
+
+  function finaliseStreamingBubble() {
+    if (streamingBubbleEl) {
+      streamingBubbleEl.innerHTML = renderMd(streamingContent);
+      streamingBubbleEl = null;
+      streamingContent = '';
+    }
+    const el = document.getElementById('streaming-bubble');
+    if (el) el.removeAttribute('id');
+  }
+
+  function fmtRelative(iso) {
+    try {
+      const d = new Date(iso);
+      const now = new Date();
+      const diff = now - d;
+      const mins = Math.floor(diff / 60000);
+      if (mins < 1)   return 'just now';
+      if (mins < 60)  return mins + 'm ago';
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24)   return hrs + 'h ago';
+      const days = Math.floor(hrs / 24);
+      if (days < 7)   return days + 'd ago';
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    } catch { return ''; }
+  }
+
+  function renderConvList(filter) {
+    convListEl.innerHTML = '';
+    const q = (filter || '').toLowerCase().trim();
+    const visible = q
+      ? conversations.filter(c => c.title.toLowerCase().includes(q))
+      : conversations;
+    if (!visible.length) {
+      const el = document.createElement('div');
+      el.style.cssText = 'font-size:12px;color:#636366;padding:8px 4px;';
+      el.textContent = q ? 'No matches' : 'No conversations yet';
+      convListEl.appendChild(el);
+      return;
+    }
+    for (const c of visible) {
+      const item = document.createElement('div');
+      item.className = 'conv-item' + (c.id === activeConvId ? ' active-conv' : '');
+      item.innerHTML =
+        '<div class="conv-item-title">' + esc(c.title || 'New chat') + '</div>' +
+        '<div class="conv-item-meta">' + fmtRelative(c.updated_at || c.created_at) + '</div>';
+      item.addEventListener('click', async () => {
+        await loadConversation(c.id);
+        setDrawer(false);
+      });
+      convListEl.appendChild(item);
+    }
+  }
+
+  // Keep renderConvSelect as alias for callers that still use it
+  function renderConvSelect() { renderConvList(convSearchInputEl ? convSearchInputEl.value : ''); }
 
   function renderUploads() {
     filePreviewRowEl.innerHTML = '';
@@ -2581,7 +2998,7 @@ async def index() -> str:
   }
 
   function renderWelcome() {
-    chatAreaEl.innerHTML = '<div class="welcome"><div class="w-avatar">J</div><h2>Hi, I\'m Jerry.</h2><p>I can help with your homelab, DevOps work, coding, screenshots, and PDF analysis. Enable tools in Settings to inspect live infra.<br><br>Upload a PNG, JPG, WebP, or PDF for analysis.</p></div>';
+    chatAreaEl.innerHTML = `<div class="welcome"><div class="w-avatar">J</div><h2>Hi, I'm Jerry.</h2><p>I can help with your homelab, DevOps work, coding, screenshots, and PDF analysis. Enable tools in Settings to inspect live infra.<br><br>Upload a PNG, JPG, WebP, or PDF for analysis.</p></div>`;
     footerLeftEl.textContent = 'No responses yet.';
     footerRightEl.textContent = 'Local';
   }
@@ -2874,9 +3291,18 @@ async def index() -> str:
       clearTimeout(tid);
       const d = await res.json();
       const name = d.preferred_name ? ' \xb7 ' + d.preferred_name : '';
-      headerStatusEl.textContent = 'Online \xb7 ' + d.text_model + name;
+      const modelLabel = textModelModeSelectEl.value === 'quality' ? d.text_model_quality : d.text_model_fast;
+      headerStatusEl.textContent = 'Online \xb7 ' + modelLabel + name;
       headerStatusEl.style.color = '';
       memoryChipEl.textContent = 'Memory: ' + (d.memory_count || 0);
+      // Update session chip with Ollama status
+      if (d.ollama_status === 'ok') {
+        sessionChipEl.textContent = d.preferred_name ? d.preferred_name : 'Boss';
+        sessionChipEl.style.color = '';
+      } else {
+        sessionChipEl.textContent = 'Ollama down';
+        sessionChipEl.style.color = '#ff9f0a';
+      }
     } catch {
       clearTimeout(tid);
       headerStatusEl.textContent = 'Backend unreachable';
@@ -2948,10 +3374,17 @@ async def index() -> str:
     modeSelectEl.value = activeConv.mode || 'general';
     updateChips(preferredNameEl.value || '', modeSelectEl.value);
     renderMessages();
+    // Re-render list so active highlight updates
+    renderConvList(convSearchInputEl ? convSearchInputEl.value : '');
   }
 
   async function createNewChat() {
     setError('');
+    // Don't create a new chat if the current one has no messages yet —
+    // the user is already on a blank conversation.
+    if (activeConv && (!activeConv.messages || activeConv.messages.length === 0)) {
+      return;
+    }
     const res = await fetch('/api/conversations', { method: 'POST' });
     if (!res.ok) { setError('Failed to create chat.'); return; }
     const d = await res.json();
@@ -3060,7 +3493,7 @@ async def index() -> str:
     const placeholder = pushStreamingPlaceholder();
 
     setStreaming(true);
-    showTyping();
+    startStreamingBubble();
     streamController = new AbortController();
 
     // State for streaming
@@ -3074,6 +3507,7 @@ async def index() -> str:
         body: JSON.stringify({
           conversation_id: activeConvId,
           mode: modeSelectEl.value,
+          text_model_mode: textModelModeSelectEl.value,
           message: pendingText,
           attachments: pendingAtts.map(a => ({ name: a.name, mime_type: a.mime_type, data_base64: a.data_base64 })),
           think: thinkToggleEl.checked,
@@ -3114,10 +3548,8 @@ async def index() -> str:
             placeholder.thinking = thinkingContent;
             renderMessages();
           } else if (evt.type === 'token') {
-            hideTyping();
-            appendToken(placeholder, evt.token || '');
+            appendStreamingToken(evt.token || '');
           } else if (evt.type === 'tool_call') {
-            showTyping();
             toolEvents.push({ tool: evt.name || '', args: evt.args || {}, result: null });
             placeholder.tool_events = toolEvents;
             renderMessages();
@@ -3129,13 +3561,12 @@ async def index() -> str:
           } else if (evt.type === 'approval_request') {
             renderApprovalCard(evt);
           } else if (evt.type === 'done') {
+            finaliseStreamingBubble();
             activeConvId = evt.conversation_id;
             activeConv   = evt.conversation;
             await refreshConversations();
             renderConvSelect();
-            convSelectEl.value = String(activeConvId);
             renderMessages();
-            hideTyping();
             footerLeftEl.textContent  = 'Last: ' + (evt.latency_ms/1000).toFixed(2) + 's';
             footerRightEl.textContent = evt.model_used || 'Local';
             await checkHealth();
@@ -3156,6 +3587,7 @@ async def index() -> str:
       }
       if (activeConvId) await loadConversation(activeConvId);
     } finally {
+      finaliseStreamingBubble();
       hideTyping();
       setStreaming(false);
       streamController = null;
@@ -3164,9 +3596,7 @@ async def index() -> str:
   }
 
   /* Event listeners */
-  convSelectEl.addEventListener('change', e => {
-    loadConversation(e.target.value ? Number(e.target.value) : null);
-  });
+  convSearchInputEl.addEventListener('input', () => renderConvList(convSearchInputEl.value));
   modeSelectEl.addEventListener('change', () => {
     updateChips(preferredNameEl.value || '', modeSelectEl.value);
   });
@@ -3235,9 +3665,16 @@ async def index() -> str:
     }
   });
 
+  textModelModeSelectEl.addEventListener('change', () => {
+    localStorage.setItem('jerry_text_model_mode', textModelModeSelectEl.value);
+  });
+
   async function boot() {
     setDrawer(false);
     setStreaming(false);
+    const savedModel = localStorage.getItem('jerry_text_model_mode');
+    if (savedModel) textModelModeSelectEl.value = savedModel;
+    else textModelModeSelectEl.value = 'fast';
     /* Run independent init tasks in parallel; don't let health hang block chat load */
     await Promise.allSettled([checkHealth(), loadProfile(), loadSession()]);
     await refreshConversations();
