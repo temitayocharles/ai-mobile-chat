@@ -286,7 +286,7 @@ class ChatRequest(BaseModel):
     message: str = Field("", max_length=MAX_USER_MESSAGE_CHARS)
     attachments: list[AttachmentInput] = Field(default_factory=list)
     think: bool = False
-    tools_enabled: bool = False
+    tools_enabled: bool = True
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -2417,15 +2417,18 @@ async def index() -> str:
       padding: 12px 16px; display: inline-flex; align-items: center; gap: 5px;
       min-width: 52px; justify-content: center;
     }
-    .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: #ebebf0;
+    .typing-bubble .typing-dot {
+      display: block;
+      width: 8px; height: 8px;
+      border-radius: 50% !important;
+      background: #ebebf0 !important;
+      flex-shrink: 0;
       animation: imsg-bounce 1.4s infinite ease-in-out;
-      transform-origin: center bottom;
+      transform-origin: center center;
     }
-    .dot:nth-child(1) { animation-delay: 0s; }
-    .dot:nth-child(2) { animation-delay: 0.28s; }
-    .dot:nth-child(3) { animation-delay: 0.56s; }
+    .typing-bubble .typing-dot:nth-child(1) { animation-delay: 0s; }
+    .typing-bubble .typing-dot:nth-child(2) { animation-delay: 0.28s; }
+    .typing-bubble .typing-dot:nth-child(3) { animation-delay: 0.56s; }
     @keyframes imsg-bounce {
       0%, 65%, 100% { transform: translateY(0) scale(0.75); opacity: 0.45; }
       35%            { transform: translateY(-6px) scale(1);  opacity: 1; }
@@ -2600,7 +2603,7 @@ async def index() -> str:
     </label>
     <label class="s-toggle-row">
       <span>Use tools (kubectl, health checks, memory)</span>
-      <input type="checkbox" id="toolsToggle" />
+      <input type="checkbox" id="toolsToggle" checked />
     </label>
     <div class="s-label">Profile memory</div>
     <div class="settings-row">
@@ -2885,7 +2888,7 @@ async def index() -> str:
     typingVisible = true;
     const row = document.createElement('div');
     row.className = 'typing-row'; row.id = 'typingIndicator';
-    row.innerHTML = '<div class="typing-avatar">J</div><div class="typing-bubble"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
+    row.innerHTML = '<div class="typing-avatar">J</div><div class="typing-bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>';
     chatAreaEl.appendChild(row);
     chatAreaEl.scrollTop = chatAreaEl.scrollHeight;
   }
