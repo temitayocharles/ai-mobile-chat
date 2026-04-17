@@ -1,0 +1,50 @@
+{
+  "version": "1.0.0",
+  "action_taxonomy": ["read", "restart", "sync", "apply", "edit", "delete", "unknown"],
+  "deny_patterns": {
+    "delete": [
+      "\\bkubectl\\s+delete\\b",
+      "\\bhelm\\s+(uninstall|delete)\\b",
+      "\\bargocd\\s+app\\s+delete\\b",
+      "\\brm\\s+-rf\\b",
+      "\\bmv\\s+.*\\s+/dev/null\\b"
+    ],
+    "edit": [
+      "\\bkubectl\\s+edit\\b",
+      "\\bkubectl\\s+replace\\b",
+      "\\bsed\\s+-i\\b",
+      "\\bperl\\s+-i\\b"
+    ]
+  },
+  "auto_approve_patterns": {
+    "restart": [
+      "\\bkubectl\\s+rollout\\s+restart\\b",
+      "\\bsystemctl\\s+restart\\b",
+      "\\bdocker\\s+restart\\b"
+    ],
+    "sync": [
+      "\\bargocd\\s+app\\s+sync\\b",
+      "\\bflux\\s+reconcile\\b"
+    ]
+  },
+  "ask_first_patterns": {
+    "apply": [
+      "\\bkubectl\\s+(apply|patch|set|label|annotate|scale|create|run)\\b",
+      "\\bhelm\\s+(install|upgrade|rollback)\\b",
+      "\\bargocd\\s+app\\s+set\\b",
+      "\\bgit\\s+(push|commit|reset|rebase|merge|force)\\b",
+      "\\bvault\\s+(write|kv\\s+put|policy\\s+write|auth\\s+enable)\\b",
+      "\\bsystemctl\\s+(start|stop|enable|disable)\\b",
+      "\\bapt(-get)?\\s+(install|remove|purge)\\b",
+      "\\byum\\s+(install|remove|erase)\\b",
+      "\\bpip\\s+install\\b",
+      "\\bnpm\\s+(install|uninstall)\\b"
+    ]
+  },
+  "read_patterns": [
+    "^\\s*kubectl\\s+(get|describe|logs|top|explain|version|cluster-info|api-resources)\\b",
+    "^\\s*argocd\\s+app\\s+get\\b",
+    "^\\s*helm\\s+(list|status)\\b",
+    "^\\s*(curl|ping|df|free|ps|journalctl|cat|grep|ls)\\b"
+  ]
+}

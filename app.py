@@ -54,25 +54,11 @@ LOKI_BASE_URL = os.getenv("LOKI_BASE_URL", "http://loki.observability.svc.cluste
 # Pull with: ollama pull nomic-embed-text
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
-# Patterns that indicate a mutating/write operation — must go through propose_write approval gate
-WRITE_COMMAND_PATTERNS = [
-    r"\bkubectl\s+(delete|patch|edit|apply|replace|scale|set|label|annotate|taint|cordon|uncordon|drain|expose|create|run)\b",
-    r"\bkubectl\s+rollout\s+(restart|undo)\b",
-    r"\bkubectl\s+exec\b",
-    r"\bkubectl\s+cp\b",
-    r"\bhelm\s+(install|upgrade|uninstall|rollback|delete)\b",
-    r"\bargocd\s+(app\s+set|app\s+delete|app\s+sync|repo\s+add|repo\s+rm|cluster\s+add|cluster\s+rm)\b",
-    r"\bgit\s+(push|commit|reset|rebase|merge|force)\b",
-    r"\bvault\s+(write|delete|kv\s+put|kv\s+delete|policy\s+write|auth\s+enable)\b",
-    r"\bsystemctl\s+(start|stop|restart|enable|disable)\b",
-    r"\bapt(-get)?\s+(install|remove|purge)\b",
-    r"\byum\s+(install|remove|erase)\b",
-    r"\bpip\s+install\b",
-    r"\bnpm\s+(install|uninstall)\b",
-    r"\b(sed|perl)\s+-i\b",
-    r"\b(touch|truncate|mv|cp|mkdir|rmdir|ln|chmod|chown|chgrp)\b",
-    r"(^|[;|&\\s])\\w[^\\n]*>\\s*[^\\s]+",
-]
+# Action taxonomy for command governance:
+# read | restart | sync | apply | edit | delete | unknown
+ACTION_TAXONOMY = ("read", "restart", "sync", "apply", "edit", "delete", "unknown")
+COMMAND_POLICY: dict = {}
+COMPILED_POLICY: dict[str, list[re.Pattern]] = {}
 
 ALLOWED_IMAGE_MIME_TYPES = {
     "image/png",
@@ -175,12 +161,10 @@ JERRY_TOOLS = [
         "function": {
             "name": "propose_write",
             "description": (
-                "Propose a write or mutating command that requires operator approval before execution. "
-                "ALWAYS use this instead of run_command for any state-changing operation: "
-                "kubectl apply/delete/patch/scale/restart/exec, helm install/upgrade/uninstall, "
-                "argocd app sync/set, git push, vault write, systemctl start/stop/restart, "
-                "package installations, or any destructive command. "
-                "The operator will see an approval card and must explicitly approve before anything runs."
+                "Propose a write or mutating command. Jerry policy decides outcome: "
+                "deny for delete/edit classes, auto-approve for restart/sync classes, "
+                "ask-first approval for other writes. "
+                "Always include clear reasoning and expected impact."
             ),
             "parameters": {
                 "type": "object",
@@ -214,6 +198,7 @@ JERRY_TOOLS = [
 ]
 
 APP_DIR = Path(__file__).resolve().parent
+POLICY_FILE_PATH = APP_DIR / "policy" / "jerry_command_policy.json"
 # Store DB on internal drive so it is always accessible at boot,
 # even before the external repo volume has mounted.
 DATA_DIR = Path.home() / "Library" / "Application Support" / "ai-mobile-chat"
@@ -221,6 +206,35 @@ DB_PATH = DATA_DIR / "jerry_chat.db"
 _LEGACY_DB_PATH = APP_DIR / "data" / "jerry_chat.db"
 
 ASSISTANT_NAME = "Jerry"
+
+
+def load_command_policy() -> tuple[dict, dict[str, list[re.Pattern]]]:
+    try:
+        policy = json.loads(POLICY_FILE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.error("Failed to load command policy file %s: %s", POLICY_FILE_PATH, exc)
+        policy = {
+            "deny_patterns": {"delete": [], "edit": []},
+            "auto_approve_patterns": {"restart": [], "sync": []},
+            "ask_first_patterns": {"apply": []},
+            "read_patterns": [],
+        }
+
+    compiled: dict[str, list[re.Pattern]] = {}
+    grouped = {
+        "deny_delete": policy.get("deny_patterns", {}).get("delete", []),
+        "deny_edit": policy.get("deny_patterns", {}).get("edit", []),
+        "auto_restart": policy.get("auto_approve_patterns", {}).get("restart", []),
+        "auto_sync": policy.get("auto_approve_patterns", {}).get("sync", []),
+        "ask_apply": policy.get("ask_first_patterns", {}).get("apply", []),
+        "read": policy.get("read_patterns", []),
+    }
+    for key, patterns in grouped.items():
+        compiled[key] = [re.compile(p, re.IGNORECASE) for p in patterns]
+    return policy, compiled
+
+
+COMMAND_POLICY, COMPILED_POLICY = load_command_policy()
 
 BASE_SYSTEM_PROMPT = """You are Jerry, the private AI assistant for TCA InfraForge, running locally on the operator's machine.
 
@@ -244,7 +258,11 @@ Tool rules (STRICTLY ENFORCED):
 - prometheus_query: PromQL instant query for metrics. Use proactively to check CPU, memory, error rates, pod restarts.
 - loki_query: LogQL for log search. Use to find recent errors, crashes, or auth failures.
 - check_url: HTTP GET health checks on any URL.
-- propose_write: REQUIRED for ANY write/mutating operation. This presents an approval card to the operator. Do not attempt to run write commands via run_command — they will be blocked. Always use propose_write for: kubectl apply/delete/patch/scale/rollout restart, helm install/upgrade, argocd sync, git push, vault write, systemctl, package installs.
+- propose_write: REQUIRED for ANY write/mutating operation. Policy behavior is fixed:
+  - delete/edit action classes: denied
+  - restart/sync action classes: auto-approved and executed
+  - other write classes (apply/update/scale/etc.): ask-first approval card
+  Never attempt to run write commands via run_command.
 - save_memory: Persist important findings, runbook steps, or decisions for future conversations.
 
 Tool discipline (HARD RULES — never violate):
@@ -258,7 +276,8 @@ Tool discipline (HARD RULES — never violate):
 
 Verification workflow:
 1. Call the most relevant tool immediately — no preamble.
-2. Interpret the output and propose a solution with clear reasoning.
+2. Interpret the output and provide root-cause-first output:
+   Incident Summary, Root Cause, Root Cause Confidence, Evidence Used, Impact and Risk, Exact Fix Plan.
 3. For write operations, use propose_write — the operator will approve or deny.
 4. After approval + execution, verify the fix with one follow-up read query.
 - Always show command output before commentary. Never fabricate tool results.""".strip()
@@ -400,6 +419,19 @@ def init_db() -> None:
                 output TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS write_policy_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                command TEXT NOT NULL,
+                action_class TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -1143,12 +1175,31 @@ def is_command_safe(cmd: str) -> tuple[bool, str]:
     return True, ""
 
 
-def is_write_command(cmd: str) -> bool:
-    """Detect mutating/write operations that require operator approval."""
-    for pattern in WRITE_COMMAND_PATTERNS:
-        if re.search(pattern, cmd, re.IGNORECASE):
-            return True
-    return False
+def classify_command_action(cmd: str) -> str:
+    command = cmd.strip().lower()
+    if any(p.search(command) for p in COMPILED_POLICY.get("deny_delete", [])):
+        return "delete"
+    if any(p.search(command) for p in COMPILED_POLICY.get("deny_edit", [])):
+        return "edit"
+    if any(p.search(command) for p in COMPILED_POLICY.get("auto_restart", [])):
+        return "restart"
+    if any(p.search(command) for p in COMPILED_POLICY.get("auto_sync", [])):
+        return "sync"
+    if any(p.search(command) for p in COMPILED_POLICY.get("ask_apply", [])):
+        return "apply"
+    if any(p.search(command) for p in COMPILED_POLICY.get("read", [])):
+        return "read"
+    return "unknown"
+
+
+def decide_command_policy(action: str) -> tuple[str, str]:
+    if action in {"delete", "edit"}:
+        return "deny", "destructive or direct-edit action blocked by policy"
+    if action in {"restart", "sync"}:
+        return "auto_approve", "soft operation class auto-approved by policy"
+    if action in {"apply", "unknown"}:
+        return "ask_first", "state-changing operation requires explicit approval"
+    return "allow_read", "read-only command"
 
 
 def _is_safe_url(url: str) -> tuple[bool, str]:
@@ -1186,6 +1237,53 @@ def store_pending_write(command: str, reasoning: str, conversation_id: int | Non
         return int(cur.lastrowid)
 
 
+def audit_policy_decision(
+    command: str,
+    action_class: str,
+    decision: str,
+    reason: str,
+    conversation_id: int | None = None,
+) -> None:
+    logger.info(
+        "write_policy_decision action=%s decision=%s command=%s",
+        action_class,
+        decision,
+        command[:120],
+    )
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO write_policy_audit (conversation_id, command, action_class, decision, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (conversation_id, command, action_class, decision, reason, now_iso()),
+        )
+        conn.commit()
+
+
+def execute_write_command(command: str) -> str:
+    safe, reason = is_command_safe(command)
+    if not safe:
+        return f"Execution blocked: {reason}"
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=TOOL_COMMAND_TIMEOUT,
+            env={**os.environ, "KUBECONFIG": os.environ.get("KUBECONFIG", os.path.expanduser("~/.kube/config"))},
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            output = f"[exit code: {result.returncode}]\n{output}" if output else f"[exit code: {result.returncode}]"
+        return _truncate_tool_output(output or "(no output)")
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {TOOL_COMMAND_TIMEOUT}s."
+    except Exception as exc:
+        return f"Execution error: {exc}"
+
+
 _TOOL_OUTPUT_MAX_LINES = 60
 _TOOL_OUTPUT_MAX_CHARS = 2000
 
@@ -1216,11 +1314,20 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         safe, reason = is_command_safe(cmd)
         if not safe:
             return f"Error: {reason}"
-        if is_write_command(cmd):
+        action = classify_command_action(cmd)
+        decision, policy_reason = decide_command_policy(action)
+        if decision != "allow_read":
+            audit_policy_decision(
+                command=cmd,
+                action_class=action,
+                decision="blocked_in_run_command",
+                reason=policy_reason,
+                conversation_id=conversation_id,
+            )
             return (
-                "WRITE_BLOCKED: This is a mutating command and cannot be run directly. "
+                "WRITE_BLOCKED: This command class cannot run via run_command. "
                 "Use the propose_write tool with this command so the operator can review and approve it. "
-                f"Command that needs approval: {cmd}"
+                f"action_class={action}; command={cmd}"
             )
         try:
             result = subprocess.run(
@@ -1347,6 +1454,27 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         safe, reason = is_command_safe(command)
         if not safe:
             return f"Error: {reason}"
+        action = classify_command_action(command)
+        decision, policy_reason = decide_command_policy(action)
+        audit_policy_decision(
+            command=command,
+            action_class=action,
+            decision=decision,
+            reason=policy_reason,
+            conversation_id=conversation_id,
+        )
+        if decision == "deny":
+            return f"WRITE_DENIED_POLICY: action={action}; reason={policy_reason}"
+        if decision == "auto_approve":
+            write_id = store_pending_write(command, reasoning, conversation_id)
+            output = execute_write_command(command)
+            with get_db_connection() as conn:
+                conn.execute(
+                    "UPDATE pending_writes SET status='approved_auto', output=?, updated_at=? WHERE id=?",
+                    (output, now_iso(), write_id),
+                )
+                conn.commit()
+            return f"AUTO_APPROVED:{write_id}\n{output}"
         pending_id = store_pending_write(command, reasoning, conversation_id)
         return f"APPROVAL_PENDING:{pending_id}"
 
@@ -1683,20 +1811,14 @@ async def approve_write(write_id: int) -> JSONResponse:
     if row["status"] != "pending":
         raise HTTPException(status_code=400, detail=f"Write is already {row['status']}.")
     cmd = row["command"]
+    action = classify_command_action(cmd)
+    decision, policy_reason = decide_command_policy(action)
+    if decision == "deny":
+        raise HTTPException(status_code=400, detail=f"Command blocked by policy: {policy_reason}")
     safe, reason = is_command_safe(cmd)
     if not safe:
         raise HTTPException(status_code=400, detail=f"Command blocked: {reason}")
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=TOOL_COMMAND_TIMEOUT,
-            env={**os.environ, "KUBECONFIG": os.environ.get("KUBECONFIG", os.path.expanduser("~/.kube/config"))},
-        )
-        output = (result.stdout + result.stderr).strip()[:4000] or "(no output)"
-    except subprocess.TimeoutExpired:
-        output = f"Command timed out after {TOOL_COMMAND_TIMEOUT}s."
-    except Exception as exc:
-        output = f"Execution error: {exc}"
+    output = execute_write_command(cmd)
     with get_db_connection() as conn:
         conn.execute(
             "UPDATE pending_writes SET status='approved', output=?, updated_at=? WHERE id=?",

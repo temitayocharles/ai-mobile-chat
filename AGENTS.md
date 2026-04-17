@@ -40,7 +40,10 @@ All models run via local Ollama on port 11434.
 
 - Never hardcode API keys, tokens, or secrets in `app.py`
 - Never expose internal infrastructure details (cluster IPs, node names) via the public endpoint
-- The `propose_write` tool requires human approval — do not weaken this gate
+- The `propose_write` tool enforces policy gates from `policy/jerry_command_policy.json`:
+  - `delete` / `edit` classes are denied
+  - `restart` / `sync` classes are auto-approved
+  - other write classes are ask-first approval
 - `run_command` is READ-ONLY (kubectl get/describe/logs, df, ps, curl) — never use for mutations
 - Do not change `DATA_DIR` from `~/Library/Application Support/ai-mobile-chat/` back to repo-relative path
 
@@ -49,6 +52,7 @@ All models run via local Ollama on port 11434.
 - `BASE_SYSTEM_PROMPT` (~line 201) — Jerry's identity and tool discipline rules
 - `get_db_connection()` (~line 285) — context manager, always closes connection
 - `execute_tool()` (~line 1125) — all tool implementations (run_command, prometheus_query, etc.)
+- `policy/jerry_command_policy.json` — deterministic allow/deny/ask policy source of truth
 - `run_tool_loop()` (~line 1307) — shared tool loop used by both streaming and non-streaming paths
 - `event_stream()` (~line 1743) — SSE streaming handler
 - `renderMd()` / `startStreamingBubble()` — frontend markdown + streaming UI
