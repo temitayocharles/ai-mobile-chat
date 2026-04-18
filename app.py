@@ -204,6 +204,54 @@ JERRY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "forgewatch_approve",
+            "description": (
+                "Approve a pending ForgeWatch write proposal. Use this when the operator says "
+                "'approve write <id>', 'yes approve it', 'go ahead with fix <id>', or similar. "
+                "ForgeWatch will immediately execute the approved fix on the cluster."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "write_id": {"type": "integer", "description": "The pending write ID to approve (shown in the ForgeWatch Discord alert)."},
+                },
+                "required": ["write_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forgewatch_deny",
+            "description": (
+                "Deny (reject) a pending ForgeWatch write proposal. Use when the operator says "
+                "'deny write <id>', 'reject fix <id>', 'no don't do that', or similar."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "write_id": {"type": "integer", "description": "The pending write ID to deny."},
+                    "reason": {"type": "string", "description": "Optional reason for denying the write."},
+                },
+                "required": ["write_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forgewatch_pending_writes",
+            "description": (
+                "List all pending ForgeWatch write proposals awaiting operator approval. "
+                "Use when the operator asks 'what fixes are pending?', 'show pending writes', "
+                "'what does ForgeWatch want to do?', or similar."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_memory",
             "description": "Persist an important fact, service detail, runbook, or infrastructure decision to Jerry's long-term memory for all future conversations.",
             "parameters": {
@@ -281,6 +329,9 @@ Capabilities — always be honest:
 Tool rules (STRICTLY ENFORCED):
 - run_command: READ-ONLY queries only (kubectl get/describe/logs/top, helm list, argocd app get, curl, ping, df, ps, journalctl, cat, grep). NEVER use for mutating operations.
 - forgewatch_ask: Ask ForgeWatch (the in-cluster AI triage agent) a question about live platform state. ForgeWatch has full access to Kubernetes, Prometheus, Loki, and ArgoCD from inside the cluster — use this when Prometheus/Loki tools fail from Mac, or for holistic "what's wrong?" questions. Always prefer forgewatch_ask over prometheus_query/loki_query for cluster health questions.
+- forgewatch_approve: Approve a pending ForgeWatch write proposal by ID. Use when the operator says "approve write 42", "go ahead", "yes do it", etc. ForgeWatch executes the fix immediately after approval.
+- forgewatch_deny: Deny a pending ForgeWatch write proposal by ID. Use when the operator says "deny write 42", "reject that", "no don't touch it", etc.
+- forgewatch_pending_writes: List all pending ForgeWatch write proposals awaiting approval. Use when asked "what fixes are pending?", "what does ForgeWatch want to do?", "show pending writes".
 - prometheus_query: PromQL instant query for metrics. Use proactively to check CPU, memory, error rates, pod restarts.
 - loki_query: LogQL for log search. Use to find recent errors, crashes, or auth failures.
 - check_url: HTTP GET health checks on any URL.
@@ -1561,6 +1612,88 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         except Exception as exc:
             return f"ForgeWatch error: {exc}"
 
+    elif name == "forgewatch_approve":
+        write_id = args.get("write_id")
+        if write_id is None:
+            return "Error: write_id is required."
+        headers: dict = {"Content-Type": "application/json"}
+        if FORGEWATCH_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FORGEWATCH_API_TOKEN}"
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{FORGEWATCH_BASE_URL}/writes/{write_id}/approve",
+                    headers=headers,
+                )
+                if resp.status_code == 401:
+                    return "ForgeWatch: authentication required. Set FORGEWATCH_API_TOKEN."
+                if resp.status_code == 404:
+                    return f"Write proposal #{write_id} not found — it may have already been approved, denied, or expired."
+                resp.raise_for_status()
+                data = resp.json()
+            outcome = data.get("output") or data.get("message") or "Approved and executed."
+            return f"✅ ForgeWatch write #{write_id} approved.\n{outcome[:1000]}"
+        except httpx.ConnectError:
+            return f"ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. The cluster API is not reachable from this host."
+        except Exception as exc:
+            return f"ForgeWatch approve error: {exc}"
+
+    elif name == "forgewatch_deny":
+        write_id = args.get("write_id")
+        reason = args.get("reason", "Denied by operator via Jerry.")
+        if write_id is None:
+            return "Error: write_id is required."
+        headers: dict = {"Content-Type": "application/json"}
+        if FORGEWATCH_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FORGEWATCH_API_TOKEN}"
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{FORGEWATCH_BASE_URL}/writes/{write_id}/deny",
+                    json={"reason": reason},
+                    headers=headers,
+                )
+                if resp.status_code == 401:
+                    return "ForgeWatch: authentication required. Set FORGEWATCH_API_TOKEN."
+                if resp.status_code == 404:
+                    return f"Write proposal #{write_id} not found — it may have already been approved, denied, or expired."
+                resp.raise_for_status()
+            return f"❌ ForgeWatch write #{write_id} denied. Reason: {reason}"
+        except httpx.ConnectError:
+            return f"ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. The cluster API is not reachable from this host."
+        except Exception as exc:
+            return f"ForgeWatch deny error: {exc}"
+
+    elif name == "forgewatch_pending_writes":
+        headers: dict = {"Content-Type": "application/json"}
+        if FORGEWATCH_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FORGEWATCH_API_TOKEN}"
+        try:
+            with httpx.Client(timeout=20) as client:
+                resp = client.get(
+                    f"{FORGEWATCH_BASE_URL}/writes/pending",
+                    headers=headers,
+                )
+                if resp.status_code == 401:
+                    return "ForgeWatch: authentication required. Set FORGEWATCH_API_TOKEN."
+                resp.raise_for_status()
+                data = resp.json()
+            writes = data if isinstance(data, list) else data.get("writes", data.get("pending", []))
+            if not writes:
+                return "✅ No pending ForgeWatch write proposals. All clear."
+            lines = ["📋 **Pending ForgeWatch Write Proposals:**\n"]
+            for w in writes[:10]:
+                wid = w.get("id", "?")
+                cmd = w.get("command", "?")[:100]
+                reason = w.get("reasoning", "")[:120]
+                created = w.get("created_at", "")[:19]
+                lines.append(f"• **Write #{wid}** [{created}]\n  `{cmd}`\n  _{reason}_")
+            return "\n".join(lines)
+        except httpx.ConnectError:
+            return f"ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. The cluster API is not reachable from this host."
+        except Exception as exc:
+            return f"ForgeWatch pending writes error: {exc}"
+
     elif name == "save_memory":
         category = args.get("category", "general")
         title    = args.get("title", "").strip()
@@ -1602,36 +1735,120 @@ def _inject_tool_force(messages: list[dict]) -> list[dict]:
     return msgs
 
 
+async def _ollama_chat_with_retry(
+    payload: dict,
+    max_retries: int = 3,
+    base_delay: float = 1.5,
+) -> dict:
+    """
+    POST to Ollama /api/chat with exponential-backoff retry.
+
+    Retries on:
+    - ConnectError / ConnectTimeout   (Ollama not yet ready or briefly restarting)
+    - ReadTimeout                     (model loading slowly — extend and retry)
+    - HTTP 5xx server errors          (Ollama internal fault)
+
+    Raises the last exception after all retries are exhausted so callers can
+    surface a human-readable message instead of a raw traceback.
+    """
+    last_exc: Exception = RuntimeError("No attempt made")
+    for attempt in range(max_retries):
+        try:
+            timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning("ollama.connect_error attempt=%d, retrying in %.1fs: %s", attempt + 1, delay, exc)
+                await asyncio.sleep(delay)
+        except httpx.ReadTimeout as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning("ollama.read_timeout attempt=%d, retrying in %.1fs", attempt + 1, delay)
+                await asyncio.sleep(delay)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500 and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning("ollama.http_%d attempt=%d, retrying in %.1fs", exc.response.status_code, attempt + 1, delay)
+                await asyncio.sleep(delay)
+                last_exc = exc
+            else:
+                raise
+    raise last_exc
+
+
+def _friendly_ollama_error(exc: Exception) -> str:
+    """Return a calm, actionable user-facing message for Ollama connectivity failures."""
+    msg = str(exc)
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            "🔌 I couldn't reach my AI backend (Ollama) right now — it may be "
+            "starting up or temporarily unavailable. Give it a moment and try again. "
+            f"_(Backend: {OLLAMA_BASE_URL})_"
+        )
+    if isinstance(exc, httpx.ReadTimeout):
+        return (
+            "⏳ The AI backend timed out — it's probably loading a model. "
+            "Try again in 10–20 seconds."
+        )
+    if "502" in msg or "503" in msg:
+        return "🚧 AI backend returned a server error. It may be overloaded — try again shortly."
+    return f"⚠️ AI backend error: {msg}"
+
+
 async def run_tool_loop(
     messages: list[dict],
     model: str,
     think: bool,
     conversation_id: Optional[int] = None,
 ) -> tuple[str, list[dict]]:
+    """
+    Run Ollama tool-calling loop with per-round resilience:
+    - Ollama calls use exponential-backoff retry (_ollama_chat_with_retry)
+    - Individual tool execution errors are caught and returned as tool results
+      (never propagate to kill the session)
+    - If Ollama is genuinely unavailable after retries, returns a friendly message
+    """
     tool_events: list[dict] = []
     msgs = _inject_tool_force(messages)
     for _ in range(3):
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={"model": TOOLS_MODEL, "messages": msgs, "stream": False, "think": think, "tools": JERRY_TOOLS},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        try:
+            data = await _ollama_chat_with_retry({
+                "model": TOOLS_MODEL,
+                "messages": msgs,
+                "stream": False,
+                "think": think,
+                "tools": JERRY_TOOLS,
+            })
+        except Exception as exc:
+            logger.error("run_tool_loop: ollama unavailable after retries: %s", exc)
+            return _friendly_ollama_error(exc), tool_events
+
         msg = data.get("message", {})
         tool_calls = msg.get("tool_calls", [])
         if not tool_calls:
             content = msg.get("content", "")
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             return content, tool_events
+
         msgs.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tool_calls})
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name", "")
             args = fn.get("arguments", {})
-            result = execute_tool(name, args, conversation_id=conversation_id)
+            try:
+                result = execute_tool(name, args, conversation_id=conversation_id)
+            except Exception as exc:
+                logger.warning("run_tool_loop: tool '%s' raised unexpectedly: %s", name, exc)
+                result = f"Tool '{name}' encountered an error: {exc}"
             tool_events.append({"tool": name, "args": args, "result": result})
             msgs.append({"role": "tool", "content": result})
+
     return "Reached maximum tool-use rounds without a final answer.", tool_events
 
 
@@ -1992,22 +2209,18 @@ async def chat(payload: ChatRequest, request: Request, background_tasks: Backgro
         if payload.tools_enabled and not current_user_images:
             answer, tool_events = await run_tool_loop(ollama_messages, selected_model, payload.think)
         else:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-                response = await client.post(
-                    f"{OLLAMA_BASE_URL}/api/chat",
-                    json={
-                        "model": selected_model,
-                        "messages": ollama_messages,
-                        "stream": False,
-                        "think": payload.think,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-            raw_answer = data["message"]["content"]
+            data = await _ollama_chat_with_retry({
+                "model": selected_model,
+                "messages": ollama_messages,
+                "stream": False,
+                "think": payload.think,
+            })
+            raw_answer = data.get("message", {}).get("content", "")
             answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL).strip()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
+    except Exception as exc:
+        # Return graceful degradation instead of a hard 502
+        logger.error("chat: ollama unavailable: %s", exc)
+        answer = _friendly_ollama_error(exc)
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
 
@@ -2134,14 +2347,17 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
                     yield f"data: {json.dumps({'type': 'token', 'token': chunk}, ensure_ascii=False)}\n\n"
 
             except Exception as exc:
+                friendly = _friendly_ollama_error(exc)
                 update_assistant_message(
                     message_id=assistant_message_id,
-                    content="[Tool loop failed.]",
+                    content=friendly,
                     latency_ms=None,
                     model_used=selected_model,
                     tool_events=tool_events,
                 )
-                yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)}, ensure_ascii=False)}\n\n"
+                # Stream the friendly message as tokens so the UI renders it normally
+                for chunk in re.findall(r'\S+\s*', friendly):
+                    yield f"data: {json.dumps({'type': 'token', 'token': chunk}, ensure_ascii=False)}\n\n"
                 return
 
         else:
@@ -2215,15 +2431,17 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
                             if chunk.get("done") is True:
                                 break
 
-            except httpx.HTTPError as exc:
+            except Exception as exc:
+                friendly = _friendly_ollama_error(exc)
                 update_assistant_message(
                     message_id=assistant_message_id,
-                    content="[Streaming failed before completion.]",
+                    content=friendly,
                     latency_ms=None,
                     model_used=selected_model,
                     tool_events=[],
                 )
-                yield f"data: {json.dumps({'type': 'error', 'detail': f'Ollama request failed: {exc}'}, ensure_ascii=False)}\n\n"
+                for chunk in re.findall(r'\S+\s*', friendly):
+                    yield f"data: {json.dumps({'type': 'token', 'token': chunk}, ensure_ascii=False)}\n\n"
                 return
 
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
