@@ -50,6 +50,8 @@ MAX_PDF_TEXT_CHARS = int(os.getenv("MAX_PDF_TEXT_CHARS", "20000"))
 TOOL_COMMAND_TIMEOUT = int(os.getenv("TOOL_COMMAND_TIMEOUT", "15"))
 PROMETHEUS_BASE_URL = os.getenv("PROMETHEUS_BASE_URL", "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090")
 LOKI_BASE_URL = os.getenv("LOKI_BASE_URL", "http://loki.observability.svc.cluster.local:3100")
+FORGEWATCH_BASE_URL = os.getenv("FORGEWATCH_BASE_URL", "http://sentinel-copilot.ai-ops.svc.cluster.local:8080")
+FORGEWATCH_API_TOKEN = os.getenv("FORGEWATCH_API_TOKEN", "")
 # Dedicated embedding model — chat models don't support embeddings
 # Pull with: ollama pull nomic-embed-text
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
@@ -179,6 +181,29 @@ JERRY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "forgewatch_ask",
+            "description": (
+                "Ask ForgeWatch — the cluster's AI triage assistant — a question about platform state. "
+                "ForgeWatch has direct access to Kubernetes, Prometheus, Loki, and ArgoCD inside the cluster. "
+                "Use this when the user asks about cluster health, pod issues, alert status, ArgoCD sync state, "
+                "metrics, or anything requiring live cluster evidence that Prometheus/Loki tools can't reach from this Mac. "
+                "Returns a structured answer with evidence, likely causes, and suggested checks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The platform question to ask ForgeWatch (e.g. 'What pods are restarting and why?')",
+                    }
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_memory",
             "description": "Persist an important fact, service detail, runbook, or infrastructure decision to Jerry's long-term memory for all future conversations.",
             "parameters": {
@@ -255,6 +280,7 @@ Capabilities — always be honest:
 
 Tool rules (STRICTLY ENFORCED):
 - run_command: READ-ONLY queries only (kubectl get/describe/logs/top, helm list, argocd app get, curl, ping, df, ps, journalctl, cat, grep). NEVER use for mutating operations.
+- forgewatch_ask: Ask ForgeWatch (the in-cluster AI triage agent) a question about live platform state. ForgeWatch has full access to Kubernetes, Prometheus, Loki, and ArgoCD from inside the cluster — use this when Prometheus/Loki tools fail from Mac, or for holistic "what's wrong?" questions. Always prefer forgewatch_ask over prometheus_query/loki_query for cluster health questions.
 - prometheus_query: PromQL instant query for metrics. Use proactively to check CPU, memory, error rates, pod restarts.
 - loki_query: LogQL for log search. Use to find recent errors, crashes, or auth failures.
 - check_url: HTTP GET health checks on any URL.
@@ -1035,10 +1061,38 @@ def prepare_current_turn_content(
     return content, image_payloads, attachment_meta
 
 
-def select_model_for_request(image_payloads: list[str], text_model_mode: str = DEFAULT_TEXT_MODEL_MODE) -> str:
+_QUALITY_TRIGGERS = re.compile(
+    r'\b('
+    r'debug|diagnose|troubleshoot|analyse|analyze|explain|why|root.?cause|'
+    r'compare|difference|architecture|design|refactor|implement|write.+code|'
+    r'script|pipeline|yaml|manifest|helm|terraform|deploy|kubernetes|k8s|'
+    r'argocd|prometheus|grafana|loki|alert|incident|error|fail|crash|oom|'
+    r'memory|cpu|latency|slow|broken|not.work|issue|problem|investigate|'
+    r'what.*wrong|how.*fix|how.*work|step.by.step|walkthrough|plan|strategy'
+    r')\b',
+    re.IGNORECASE,
+)
+
+def select_model_for_request(
+    image_payloads: list[str],
+    text_model_mode: str = DEFAULT_TEXT_MODEL_MODE,
+    message: str = "",
+) -> str:
+    """Route to quality or fast model.
+
+    Priority:
+    1. Images → vision model always.
+    2. Explicit UI toggle (quality/fast) → honour it.
+    3. If toggle is 'fast' (default) but message looks complex → auto-upgrade to quality.
+    """
     if image_payloads:
         return VISION_MODEL
-    return TEXT_MODEL_QUALITY if text_model_mode == "quality" else TEXT_MODEL_FAST
+    if text_model_mode == "quality":
+        return TEXT_MODEL_QUALITY
+    # Auto-upgrade: fast is default but we bump to quality for ops/debug questions
+    if message and _QUALITY_TRIGGERS.search(message):
+        return TEXT_MODEL_QUALITY
+    return TEXT_MODEL_FAST
 
 
 async def build_ollama_messages(
@@ -1478,6 +1532,35 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         pending_id = store_pending_write(command, reasoning, conversation_id)
         return f"APPROVAL_PENDING:{pending_id}"
 
+    elif name == "forgewatch_ask":
+        question = args.get("question", "").strip()
+        if not question:
+            return "Error: question is required."
+        headers: dict = {"Content-Type": "application/json"}
+        if FORGEWATCH_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FORGEWATCH_API_TOKEN}"
+        try:
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(
+                    f"{FORGEWATCH_BASE_URL}/ask",
+                    json={"question": question},
+                    headers=headers,
+                )
+                if resp.status_code == 401:
+                    return "ForgeWatch: authentication required. Set FORGEWATCH_API_TOKEN."
+                resp.raise_for_status()
+                data = resp.json()
+            answer = data.get("answer") or data.get("summary") or str(data)
+            return f"[ForgeWatch]\n{answer[:3000]}"
+        except httpx.ConnectError:
+            return (
+                f"ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. "
+                "It runs inside the cluster — only reachable via kubectl port-forward or from within the cluster. "
+                "Run: kubectl -n ai-ops port-forward deploy/sentinel-copilot 8000:8080"
+            )
+        except Exception as exc:
+            return f"ForgeWatch error: {exc}"
+
     elif name == "save_memory":
         category = args.get("category", "general")
         title    = args.get("title", "").strip()
@@ -1901,7 +1984,7 @@ async def chat(payload: ChatRequest, request: Request, background_tasks: Backgro
         current_user_images=current_user_images,
     )
 
-    selected_model = select_model_for_request(current_user_images, payload.text_model_mode)
+    selected_model = select_model_for_request(current_user_images, payload.text_model_mode, message=payload.message or "")
     started_at = time.perf_counter()
     tool_events: list[dict] = []
 
@@ -2012,7 +2095,7 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
         current_user_images=current_user_images,
     )
 
-    selected_model = select_model_for_request(current_user_images, payload.text_model_mode)
+    selected_model = select_model_for_request(current_user_images, payload.text_model_mode, message=payload.message or "")
     assistant_message_id = save_message(
         conversation_id=conversation_id,
         role="assistant",
