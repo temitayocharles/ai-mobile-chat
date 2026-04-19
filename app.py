@@ -38,6 +38,9 @@ VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:2b-instruct-q4_K_M")
 TOOLS_MODEL = TEXT_MODEL_QUALITY
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "14"))
+# Ops modes need more context — a single kubectl investigation session can easily
+# span 10+ tool-call exchanges before Jerry reaches a conclusion.
+MAX_HISTORY_MESSAGES_OPS = int(os.getenv("MAX_HISTORY_MESSAGES_OPS", "30"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "300"))
 
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -1313,7 +1316,10 @@ async def build_ollama_messages(
     current_user_images: list[str],
 ) -> list[dict]:
     history = fetch_messages(conversation_id)
-    history = history[-MAX_HISTORY_MESSAGES:]
+    # Ops modes (homelab/devops) get a larger history window so multi-step
+    # investigations and long tool-call chains retain enough context.
+    _limit = MAX_HISTORY_MESSAGES_OPS if mode in {"homelab", "devops"} else MAX_HISTORY_MESSAGES
+    history = history[-_limit:]
 
     # Use semantic context retrieval when a text query is available (no images)
     if current_user_content and not current_user_images:
@@ -2164,6 +2170,97 @@ async def generate_smart_title(conversation_id: int, user_msg: str, assistant_ms
         logger.warning("Smart title generation failed: %s", exc)
 
 
+_AUTO_REMEMBER_MIN_TOOLS = int(os.getenv("AUTO_REMEMBER_MIN_TOOLS", "3"))
+
+
+async def auto_remember_session(
+    conversation_id: int,
+    tool_events: list[dict],
+    answer: str,
+) -> None:
+    """
+    Background task: after a tool-heavy turn (≥ AUTO_REMEMBER_MIN_TOOLS tool calls),
+    ask the LLM to synthesize a runbook entry from what was done and store it to
+    ForgeWatch.  Fires asynchronously — never blocks the response to the user.
+    Auto-generated entries are tagged with the 'auto-' fingerprint prefix and
+    confirmed=False so they are distinguishable from hand-written entries.
+    """
+    if len(tool_events) < _AUTO_REMEMBER_MIN_TOOLS:
+        return
+
+    # Compact summary of the tool calls (cap to avoid context overflow)
+    tool_lines: list[str] = []
+    for te in tool_events[:10]:
+        tool_lines.append(
+            f"Tool: {te['tool']}\n"
+            f"Args: {json.dumps(te['args'])[:200]}\n"
+            f"Result: {str(te['result'])[:300]}"
+        )
+    tool_summary = "\n---\n".join(tool_lines)
+
+    prompt = (
+        "You are an SRE knowledge-base writer. Based on the following tool calls and the "
+        "final answer from a platform investigation session, produce a concise runbook entry.\n\n"
+        f"Tool calls:\n{tool_summary}\n\n"
+        f"Final answer:\n{answer[:600]}\n\n"
+        "Output ONLY a JSON object with these exact keys (no markdown, no explanation):\n"
+        "{\n"
+        '  "fingerprint": "<kebab-case-unique-id, e.g. argo-app-sync-failed-cert-manager>",\n'
+        '  "title": "<short title, max 80 chars>",\n'
+        '  "diagnosis": "<1-3 sentences: what was found and what was done>",\n'
+        '  "commands": ["<command 1>", "<command 2>"],\n'
+        '  "evidence": ["<key finding 1>", "<key finding 2>"]\n'
+        "}"
+    )
+
+    try:
+        data = await _ollama_chat_with_retry({
+            "model": TOOLS_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "think": False,
+        })
+        raw = data.get("message", {}).get("content", "").strip()
+        # Strip markdown code fences if the model wraps output in ```json … ```
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        entry = json.loads(raw)
+    except Exception as exc:
+        logger.warning("auto_remember: LLM synthesis failed: %s", exc)
+        return
+
+    fp = str(entry.get("fingerprint", "")).strip()
+    title = str(entry.get("title", "")).strip()
+    diagnosis = str(entry.get("diagnosis", "")).strip()
+    if not fp or not title or not diagnosis:
+        logger.warning("auto_remember: incomplete LLM entry — skipping: %s", entry)
+        return
+
+    # Prefix fingerprint so auto-generated entries are easy to identify / audit
+    entry["fingerprint"] = f"auto-{fp}"
+    entry["confirmed"] = False
+
+    try:
+        headers = {"Content-Type": "application/json", "User-Agent": "Jerry/1.0"}
+        if FORGEWATCH_API_TOKEN:
+            headers["X-API-Key"] = FORGEWATCH_API_TOKEN
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{FORGEWATCH_BASE_URL}/memory/store",
+                json=entry,
+                headers=headers,
+            )
+            resp.raise_for_status()
+        logger.info(
+            "auto_remember: stored runbook entry fingerprint=%s title=%s conv=%s",
+            entry["fingerprint"], title, conversation_id,
+        )
+    except httpx.ConnectError:
+        logger.warning("auto_remember: ForgeWatch unreachable — entry not persisted")
+    except Exception as exc:
+        logger.warning("auto_remember: store failed: %s", exc)
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     logger.info("Jerry starting up — DB: %s", DB_PATH)
@@ -2571,6 +2668,11 @@ async def chat(payload: ChatRequest, request: Request, background_tasks: Backgro
     if msg_count <= 2:
         background_tasks.add_task(generate_smart_title, conversation_id, user_content_for_storage, answer)
 
+    # Auto-remember: if this turn was tool-heavy, synthesise a runbook entry
+    # and persist it to ForgeWatch in the background.
+    if len(tool_events) >= _AUTO_REMEMBER_MIN_TOOLS:
+        background_tasks.add_task(auto_remember_session, conversation_id, tool_events, answer)
+
     conversation_payload = get_conversation_payload(conversation_id)
 
     return JSONResponse(
@@ -2677,6 +2779,10 @@ async def chat_stream(payload: ChatRequest, request: Request, background_tasks: 
                 import re as _re
                 for chunk in _re.findall(r'\S+\s*', full_answer):
                     yield f"data: {json.dumps({'type': 'token', 'token': chunk}, ensure_ascii=False)}\n\n"
+
+                # Auto-remember: tool-heavy turns get a background runbook entry
+                if len(tool_events) >= _AUTO_REMEMBER_MIN_TOOLS:
+                    asyncio.ensure_future(auto_remember_session(_conv_id, tool_events, full_answer))
 
             except Exception as exc:
                 friendly = _friendly_ollama_error(exc)
