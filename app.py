@@ -2217,7 +2217,7 @@ async def _load_forgewatch_runbook_cache() -> None:
     global _FW_RUNBOOK_CACHE, _FW_RUNBOOK_CACHE_LOADED
     await asyncio.sleep(5)  # Give Ollama / network a moment to settle
     try:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "User-Agent": "Jerry/1.0"}
         if FORGEWATCH_API_TOKEN:
             headers["X-API-Key"] = FORGEWATCH_API_TOKEN
         async with httpx.AsyncClient(timeout=10.0) as client:
