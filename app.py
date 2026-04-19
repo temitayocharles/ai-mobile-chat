@@ -1915,11 +1915,12 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
             "confirmed": True,
         }
         try:
-            headers = {"Content-Type": "application/json"}
+            # execute_tool is a sync def — use httpx.Client (not AsyncClient)
+            headers = {"Content-Type": "application/json", "User-Agent": "Jerry/1.0"}
             if FORGEWATCH_API_TOKEN:
                 headers["X-API-Key"] = FORGEWATCH_API_TOKEN
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(
                     f"{FORGEWATCH_BASE_URL}/memory/store",
                     json=payload,
                     headers=headers,
@@ -1938,11 +1939,12 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         if not query:
             return "Error: query is required."
         try:
-            headers = {"Content-Type": "application/json"}
+            # execute_tool is a sync def — use httpx.Client (not AsyncClient)
+            headers = {"Content-Type": "application/json", "User-Agent": "Jerry/1.0"}
             if FORGEWATCH_API_TOKEN:
                 headers["X-API-Key"] = FORGEWATCH_API_TOKEN
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(
                     f"{FORGEWATCH_BASE_URL}/memory/search",
                     json={"query": query, "n": n, "include_incidents": True},
                     headers=headers,
