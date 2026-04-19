@@ -52,6 +52,13 @@ PROMETHEUS_BASE_URL = os.getenv("PROMETHEUS_BASE_URL", "http://kube-prometheus-s
 LOKI_BASE_URL = os.getenv("LOKI_BASE_URL", "http://loki.observability.svc.cluster.local:3100")
 FORGEWATCH_BASE_URL = os.getenv("FORGEWATCH_BASE_URL", "http://sentinel-copilot.ai-ops.svc.cluster.local:8080")
 FORGEWATCH_API_TOKEN = os.getenv("FORGEWATCH_API_TOKEN", "")
+
+# ── ForgeWatch runbook bootstrap cache ───────────────────────────────────────
+# Loaded once at startup (best-effort). Injected into Jerry's system prompt so
+# every session starts with core platform knowledge already loaded, without
+# requiring an explicit recall() call for common questions.
+_FW_RUNBOOK_CACHE: list[dict] = []
+_FW_RUNBOOK_CACHE_LOADED: bool = False
 # Dedicated embedding model — chat models don't support embeddings
 # Pull with: ollama pull nomic-embed-text
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
@@ -266,7 +273,7 @@ JERRY_TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Persist an important fact, service detail, runbook, or infrastructure decision to Jerry's long-term memory for all future conversations.",
+            "description": "Persist an important fact, service detail, runbook, or infrastructure decision to Jerry's local memory for this device. For platform-wide knowledge that ForgeWatch should also know (topology, fixes, procedures), use remember() instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -278,6 +285,78 @@ JERRY_TOOLS = [
                     "content": {"type": "string"},
                 },
                 "required": ["category", "title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Write platform knowledge to ForgeWatch's shared runbook (ChromaDB on Longhorn). "
+                "Use this when you learn something important about the platform that both you AND "
+                "ForgeWatch should know in future: how something is deployed, a fix that worked, "
+                "a file path that matters, a gotcha encountered, a procedure you just executed. "
+                "This persists across ALL future sessions and is also used by ForgeWatch's "
+                "Overwatch Angel investigations. Call this at the end of any significant "
+                "problem-solving session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fingerprint": {
+                        "type": "string",
+                        "description": "Stable slug key for upsert, e.g. 'how-to-expose-service' or 'fix-oom-sentinel-copilot-2026-04'. Use hyphens, no spaces.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short searchable phrase, e.g. 'How to expose service via Cloudflare tunnel'",
+                    },
+                    "diagnosis": {
+                        "type": "string",
+                        "description": "Full explanation — what the problem/procedure was, what was tried, what worked, file paths changed, commands run.",
+                    },
+                    "commands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Shell commands to verify or reproduce",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths, vault keys, hostnames, or other searchable anchors",
+                    },
+                },
+                "required": ["fingerprint", "title", "diagnosis"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Search ForgeWatch's shared platform knowledge base (runbook + past incidents) "
+                "using a natural language query. Call this BEFORE trying to figure out how to "
+                "do something from scratch — there may already be a documented procedure, a past "
+                "fix, or a known gotcha. Examples: 'how to expose service cloudflare', "
+                "'exec format error crash', 'vault secret path for discord webhook', "
+                "'sentinel-copilot networkpolicy ingress'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query",
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Max results (default 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -394,7 +473,16 @@ Tool rules (STRICTLY ENFORCED):
   When APPROVAL_PENDING:{id} is returned: show the operator the ID prominently and say:
     "✋ Write proposal #{id} is pending your approval. Say **approve write {id}** to execute."
   Never attempt to run write commands via run_command.
-- save_memory: Persist important findings, runbook steps, or decisions for future conversations.
+- save_memory: Persist quick local notes and facts to Jerry's local memory (this device only).
+- remember: Write platform knowledge to ForgeWatch's SHARED runbook (ChromaDB on Longhorn).
+  Use after solving any significant problem or learning a new procedure. Both Jerry AND
+  ForgeWatch will recall this in all future sessions. Provide: fingerprint (slug), title,
+  diagnosis (full explanation), commands, evidence (file paths, vault keys, hostnames).
+  Call remember() at the end of ANY session where you: fixed something, discovered a procedure,
+  found a file path that matters, or worked around a known gotcha.
+- recall: Search ForgeWatch's shared platform knowledge BEFORE trying to figure out how to do
+  something from scratch. Query: 'how to expose service', 'exec format error', 'vault path for X'.
+  If there's a documented procedure, use it instead of reasoning from first principles.
 
 Tool discipline (HARD RULES — never violate):
 1. When tools are enabled and the request requires live data: CALL A TOOL FIRST. No preamble, no
@@ -800,19 +888,34 @@ async def build_system_prompt_with_semantic_context(mode: str, user_query: str) 
             f"\n- The user's preferred name is {preferred_name}."
             f"\n- Address the user as {preferred_name} when natural and appropriate."
         )
+    # ── ForgeWatch shared runbook (platform-wide institutional knowledge) ──────
+    # Inject the startup cache of ForgeWatch runbook entries. This gives Jerry
+    # core platform topology knowledge on every session without an explicit recall() call.
+    if _FW_RUNBOOK_CACHE:
+        runbook_lines = []
+        for entry in _FW_RUNBOOK_CACHE[:6]:  # top 6 most relevant entries
+            meta = entry.get("metadata", entry)
+            title = meta.get("title", "")
+            diag  = meta.get("diagnosis", "")
+            if title and diag:
+                runbook_lines.append(f"**{title}**\n{diag[:400]}" + ("…" if len(diag) > 400 else ""))
+        if runbook_lines:
+            prompt += "\n\n## Platform Knowledge (from ForgeWatch runbook)\n" + "\n\n".join(runbook_lines)
+
+    # ── Local memory (semantic or full list) ──────────────────────────────────
     # Try semantic retrieval first (run in thread pool to avoid blocking event loop)
     query_emb = await asyncio.to_thread(get_embedding_sync, user_query)
     if query_emb:
         relevant = semantic_search_memories(query_emb, top_k=8)
         if relevant:
             lines = [f"[{m['category']}] {m['title']}: {m['content']}" for m in relevant]
-            prompt += "\n\nMost relevant infrastructure memory (semantically matched):\n" + "\n".join(f"- {l}" for l in lines)
+            prompt += "\n\nMost relevant local memory (semantically matched):\n" + "\n".join(f"- {l}" for l in lines)
             return prompt
     # Fallback: inject all memories
     mems = list_memories()
     if mems:
         lines = [f"[{m['category']}] {m['title']}: {m['content']}" for m in mems]
-        prompt += "\n\nJerry's persistent infrastructure memory:\n" + "\n".join(f"- {l}" for l in lines)
+        prompt += "\n\nJerry's local infrastructure memory:\n" + "\n".join(f"- {l}" for l in lines)
     return prompt
 
 
@@ -1794,6 +1897,91 @@ def execute_tool(name: str, args: dict, conversation_id: int | None = None) -> s
         mem_id = create_memory(category, title, content)
         return f"Memory saved (id={mem_id}): [{category}] {title}"
 
+    elif name == "remember":
+        # Write to ForgeWatch shared runbook — platform-wide persistent knowledge
+        fingerprint = args.get("fingerprint", "").strip()
+        title       = args.get("title", "").strip()
+        diagnosis   = args.get("diagnosis", "").strip()
+        commands    = args.get("commands", [])
+        evidence    = args.get("evidence", [])
+        if not fingerprint or not title or not diagnosis:
+            return "Error: fingerprint, title and diagnosis are required."
+        payload = {
+            "fingerprint": fingerprint,
+            "title": title,
+            "diagnosis": diagnosis,
+            "commands": commands,
+            "evidence": evidence,
+            "confirmed": True,
+        }
+        try:
+            headers = {"Content-Type": "application/json"}
+            if FORGEWATCH_API_TOKEN:
+                headers["X-API-Key"] = FORGEWATCH_API_TOKEN
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{FORGEWATCH_BASE_URL}/memory/store",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return f"✅ Remembered: [{fingerprint}] {title}\nStored in ForgeWatch runbook — ForgeWatch and future Jerry sessions can now recall this."
+        except httpx.ConnectError:
+            return f"⚠️ ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. Memory not persisted to shared runbook."
+        except Exception as exc:
+            return f"⚠️ remember failed: {exc}"
+
+    elif name == "recall":
+        # Query ForgeWatch shared knowledge base
+        query = args.get("query", "").strip()
+        n     = int(args.get("n", 5))
+        if not query:
+            return "Error: query is required."
+        try:
+            headers = {"Content-Type": "application/json"}
+            if FORGEWATCH_API_TOKEN:
+                headers["X-API-Key"] = FORGEWATCH_API_TOKEN
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{FORGEWATCH_BASE_URL}/memory/search",
+                    json={"query": query, "n": n, "include_incidents": True},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.ConnectError:
+            return f"⚠️ ForgeWatch unreachable at {FORGEWATCH_BASE_URL}. Cannot query shared runbook."
+        except Exception as exc:
+            return f"⚠️ recall failed: {exc}"
+
+        runbook  = data.get("runbook", [])
+        incidents = data.get("incidents", [])
+        if not runbook and not incidents:
+            return f"No results found for: '{query}'. The runbook may not have entries on this topic yet."
+
+        lines = [f"🔍 Recall results for: '{query}'\n"]
+        if runbook:
+            lines.append(f"**Runbook ({len(runbook)} entries):**")
+            for entry in runbook:
+                meta = entry.get("metadata", entry)
+                lines.append(f"\n📖 **{meta.get('title', '?')}**")
+                diag = meta.get("diagnosis", "")
+                lines.append(diag[:600] + ("…" if len(diag) > 600 else ""))
+                cmds = meta.get("commands")
+                if cmds:
+                    try:
+                        cmd_list = json.loads(cmds) if isinstance(cmds, str) else cmds
+                        if cmd_list:
+                            lines.append("Commands: " + " | ".join(f"`{c}`" for c in cmd_list[:3]))
+                    except Exception:
+                        pass
+        if incidents:
+            lines.append(f"\n**Past incidents ({len(incidents)} matches):**")
+            for inc in incidents[:3]:
+                meta = inc.get("metadata", inc)
+                lines.append(f"• [{meta.get('severity','?')}] {meta.get('title','?')} — {meta.get('root_cause','')[:150]}")
+        return "\n".join(lines)
+
     return f"Error: unknown tool '{name}'."
 
 
@@ -2013,7 +2201,37 @@ async def startup_event() -> None:
             logger.info("Found %d potentially dangling user messages (last sends, not marking)", len(dangling))
     # Backfill embeddings for any memories that don't have one yet
     asyncio.create_task(_backfill_embeddings())
+    # Load ForgeWatch shared runbook into session bootstrap cache (best-effort, non-blocking)
+    asyncio.create_task(_load_forgewatch_runbook_cache())
     logger.info("Startup complete")
+
+
+async def _load_forgewatch_runbook_cache() -> None:
+    """
+    Load ForgeWatch shared runbook into module-level cache at startup.
+    Best-effort: never raises, so Jerry starts up even if ForgeWatch is down.
+    Queries for broad platform context — injected into every system prompt.
+    """
+    global _FW_RUNBOOK_CACHE, _FW_RUNBOOK_CACHE_LOADED
+    await asyncio.sleep(5)  # Give Ollama / network a moment to settle
+    try:
+        headers = {"Content-Type": "application/json"}
+        if FORGEWATCH_API_TOKEN:
+            headers["X-API-Key"] = FORGEWATCH_API_TOKEN
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{FORGEWATCH_BASE_URL}/memory/search",
+                json={"query": "platform topology deployment architecture service exposure", "n": 8, "include_incidents": False},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        _FW_RUNBOOK_CACHE = data.get("runbook", [])
+        _FW_RUNBOOK_CACHE_LOADED = True
+        logger.info("ForgeWatch runbook cache loaded: %d entries", len(_FW_RUNBOOK_CACHE))
+    except Exception as exc:
+        logger.warning("ForgeWatch runbook cache load failed (non-fatal): %s", exc)
+        _FW_RUNBOOK_CACHE_LOADED = True  # Don't retry indefinitely
 
 
 async def _backfill_embeddings() -> None:
