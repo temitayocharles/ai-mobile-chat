@@ -96,3 +96,5 @@ data/
 # Optional: local developer docs/output
 # -----------------------------
 *.sqlite3
+PERSONAL.code-workspace
+source
